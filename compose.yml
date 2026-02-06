@@ -1,0 +1,98 @@
+services:
+  llmdb:
+    image: postgres:16
+    container_name: llmdb
+    labels:
+      - "ns.module=llm"
+      - "ns.component=db"
+      - "ns.db_owner=llm"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${PORT_DB_LLM:-${POSTGRES_PORT:-5435}}:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+  llmcore:
+    build: ./core
+    container_name: llmcore
+    labels:
+      - "ns.module=llm"
+      - "ns.component=core"
+    environment:
+      CORE_HTTP_ADDR: ${CORE_HTTP_HOST:-0.0.0.0}:${CORE_HTTP_PORT:-${PORT_HTTP_LLMCORE:-8080}}
+      CORE_GRPC_ADDR: ${CORE_GRPC_HOST:-0.0.0.0}:${CORE_GRPC_PORT:-${PORT_GRPC_LLMCORE:-9090}}
+      CORE_VERSION: ${LLM_MCP_VERSION}
+      DISCOVERY_INTERVAL: ${DISCOVERY_INTERVAL}
+      DEVICE_MAX_CONCURRENCY: ${DEVICE_MAX_CONCURRENCY}
+      STRICT_MODEL_LIMITS: ${STRICT_MODEL_LIMITS}
+      DEVICE_LIMITS_INTERVAL: ${DEVICE_LIMITS_INTERVAL}
+      DEVICE_LIMITS_JSON: ${DEVICE_LIMITS_JSON}
+      DEVICE_LIMITS_FILE: ${DEVICE_LIMITS_FILE}
+      DB_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@llmdb:5432/${POSTGRES_DB}?sslmode=disable
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+    volumes:
+      - /usr/bin/tailscale:/usr/bin/tailscale:ro
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro
+    ports:
+      - "${PORT_HTTP_LLMCORE:-${CORE_HTTP_PORT:-8080}}:8080"
+    depends_on:
+      - llmdb
+
+  llmworker:
+    build: ./worker
+    container_name: llmworker
+    labels:
+      - "ns.module=llm"
+      - "ns.component=worker"
+    environment:
+      CORE_GRPC_ADDR: llmcore:${CORE_GRPC_PORT:-${PORT_GRPC_LLMCORE:-9090}}
+      CORE_HTTP_URL: http://llmcore:8080
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - llmcore
+
+  llmtelemetry:
+    build: ./telemetry
+    container_name: llmtelemetry
+    labels:
+      - "ns.module=llm"
+      - "ns.component=telemetry"
+    environment:
+      DB_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@llmdb:5432/${POSTGRES_DB}?sslmode=disable
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_USE_MCP: ${TELEGRAM_USE_MCP:-0}
+      TELEGRAM_MCP_BASE_URL: ${TELEGRAM_MCP_BASE_URL:-http://tgapi:8000}
+      TELEGRAM_MCP_BOT_ID: ${TELEGRAM_MCP_BOT_ID}
+      TELEGRAM_MCP_CHAT_ID: ${TELEGRAM_MCP_CHAT_ID}
+      TELEGRAM_MCP_FALLBACK_DIRECT: ${TELEGRAM_MCP_FALLBACK_DIRECT:-1}
+      TELEGRAM_UPDATE_INTERVAL: ${TELEGRAM_UPDATE_INTERVAL}
+      TELEMETRY_RUNNING_LIMIT: ${TELEMETRY_RUNNING_LIMIT}
+      TELEMETRY_DEVICE_LIMIT: ${TELEMETRY_DEVICE_LIMIT}
+      TELEMETRY_MAX_LEN: ${TELEMETRY_MAX_LEN}
+    depends_on:
+      - llmcore
+
+  llmmcp:
+    build: ./mcp
+    container_name: llmmcp
+    labels:
+      - "ns.module=llm"
+      - "ns.component=mcp"
+    environment:
+      CORE_GRPC_ADDR: llmcore:${CORE_GRPC_PORT:-${PORT_GRPC_LLMCORE:-9090}}
+      MCP_HTTP_ADDR: ${MCP_HTTP_HOST:-0.0.0.0}:${MCP_HTTP_PORT:-${PORT_MCP_LLM:-3333}}
+      PROTO_PATH: /app/proto/llm.proto
+    ports:
+      - "${PORT_MCP_LLM:-${MCP_HTTP_PORT:-3333}}:3333"
+    depends_on:
+      - llmcore

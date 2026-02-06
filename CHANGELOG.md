@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.02.4] - 2026-02-07
+
+- `README.md` приведён к единому визуальному стилю NeuronSwarm:
+  - badges, кнопки-навигации и emoji-структура;
+  - обновлены блоки архитектуры, quick start, API и env-контрактов.
+- Добавлен раздел `Public Git Standards`:
+  - версия в формате `YYYY.MM.x`;
+  - обязательный `CHANGELOG.md`;
+  - исключение секретов из git и smoke-проверка перед merge.
+- Обновлён `VERSION` до `2026.02.4`.
+
 ## [2026.02.3] - 2026-02-06
 
 - Compose naming normalized to short alnum containers:

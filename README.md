@@ -1,6 +1,6 @@
 # LLM-MCP
 
-[![Version](https://img.shields.io/badge/version-2026.02.5-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-2026.02.6-blue.svg)](VERSION)
 [![Runtime](https://img.shields.io/badge/runtime-go%20%2B%20python%20%2B%20node-green.svg)](compose.yml)
 [![Queue](https://img.shields.io/badge/queue-postgres-orange.svg)](db/init)
 [![Transport](https://img.shields.io/badge/transport-http%20%2B%20grpc-7a3cff.svg)](proto/llm.proto)
@@ -92,6 +92,7 @@ curl -fsS http://127.0.0.1:3333/health || true
 - `OPENAI_API_KEY`, `OPENROUTER_API_KEY`.
 - `TELEGRAM_USE_MCP`, `TELEGRAM_MCP_BASE_URL`, `TELEGRAM_MCP_BOT_ID`, `TELEGRAM_MCP_CHAT_ID`.
 - `TELEGRAM_MCP_FALLBACK_DIRECT=1` для отказоустойчивого маршрута телеметрии.
+- Если `TELEGRAM_MCP_BASE_URL` не задан, используется `http://tgapi:8000`; на 1 релиз включён legacy retry к `http://telegram-api:8000`.
 
 ## 📚 Документация
 

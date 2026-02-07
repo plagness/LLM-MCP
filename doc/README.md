@@ -325,6 +325,7 @@ Core выполняет `tailscale status --json`, обновляет табли
 - Статусы задач: `GET /v1/jobs/{id}`
 - Telegram‑телеметрия: сервис `llmtelemetry` редактирует одно сообщение и каждые ~2 секунды показывает очередь, бенчмарки, устройства и нагрузку.
   - Рекомендуемый маршрут: через `telegram-mcp` (`TELEGRAM_USE_MCP=1`, `TELEGRAM_MCP_BASE_URL`, `TELEGRAM_MCP_BOT_ID`, `TELEGRAM_MCP_CHAT_ID`).
+  - Default URL маршрута: `http://tgapi:8000`; при неявной конфигурации сохранён compat retry на `http://telegram-api:8000` (1 релиз).
   - Fallback: прямой Telegram (`TELEGRAM_MCP_FALLBACK_DIRECT=1`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
   - Частоту можно менять через `TELEGRAM_UPDATE_INTERVAL`.
 

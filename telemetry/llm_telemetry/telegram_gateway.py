@@ -175,6 +175,7 @@ class TelegramGateway:
     use_mcp: bool
     chat_id: str
     mcp_base_url: str
+    mcp_base_explicit: bool
     mcp_bot_id: int | None
     fallback_direct: bool
     direct_token: str
@@ -184,6 +185,7 @@ class TelegramGateway:
         import os
 
         use_mcp = _env_bool("TELEGRAM_USE_MCP", False)
+        explicit_base = os.getenv("TELEGRAM_MCP_BASE_URL", "").strip()
         chat_id = (
             os.getenv("TELEGRAM_MCP_CHAT_ID", "").strip()
             or os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -192,7 +194,8 @@ class TelegramGateway:
         return cls(
             use_mcp=use_mcp,
             chat_id=chat_id,
-            mcp_base_url=os.getenv("TELEGRAM_MCP_BASE_URL", "http://telegram-api:8000").strip(),
+            mcp_base_url=explicit_base or "http://tgapi:8000",
+            mcp_base_explicit=bool(explicit_base),
             mcp_bot_id=_env_int("TELEGRAM_MCP_BOT_ID"),
             fallback_direct=_env_bool("TELEGRAM_MCP_FALLBACK_DIRECT", True),
             direct_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -216,6 +219,17 @@ class TelegramGateway:
                 mcp_client = MCPTelegramClient(self.mcp_base_url, self.chat_id, self.mcp_bot_id)
             except Exception as exc:
                 log.warning("telegram mcp client init failed err=%s", exc)
+                if not self.mcp_base_explicit and self.mcp_base_url == "http://tgapi:8000":
+                    legacy = "http://telegram-api:8000"
+                    try:
+                        log.warning(
+                            "telegram mcp legacy fallback enabled from=%s to=%s",
+                            self.mcp_base_url,
+                            legacy,
+                        )
+                        mcp_client = MCPTelegramClient(legacy, self.chat_id, self.mcp_bot_id)
+                    except Exception as legacy_exc:
+                        log.warning("telegram mcp legacy init failed err=%s", legacy_exc)
 
         if self.direct_token:
             direct_client = DirectTelegramClient(self.direct_token, self.chat_id)

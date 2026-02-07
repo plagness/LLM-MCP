@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026.02.6] - 2026-02-07
+
+- `telemetry/llm_telemetry/telegram_gateway.py`:
+  - default `TELEGRAM_MCP_BASE_URL` переключен на `http://tgapi:8000`;
+  - добавлен compat fallback на legacy `http://telegram-api:8000` при неявной конфигурации.
+- `README.md` и `doc/README.md` синхронизированы с новым routing default и compat-window.
+- Добавлены governance-файлы публичного репозитория:
+  - `LICENSE` (MIT), `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`;
+  - `.github/ISSUE_TEMPLATE/*`, `.github/pull_request_template.md`, `.github/CODEOWNERS`.
+- Обновлены `VERSION` и `.env.example` до `2026.02.6`.
+- Добавлен pragmatic CI: `.github/workflows/ci.yml` (compose config, markdown links, Python compile, Go test, MCP TS build).
+
+
 ## [2026.02.5] - 2026-02-07
 
 - Синхронизирована версия модуля в `.env.example`:

@@ -90,6 +90,7 @@ services:
       - "ns.component=mcp"
     environment:
       CORE_GRPC_ADDR: llmcore:${CORE_GRPC_PORT:-${PORT_GRPC_LLMCORE:-9090}}
+      CORE_HTTP_URL: http://llmcore:8080
       MCP_HTTP_ADDR: ${MCP_HTTP_HOST:-0.0.0.0}:${MCP_HTTP_PORT:-${PORT_MCP_LLM:-3333}}
       PROTO_PATH: /app/proto/llm.proto
     ports:

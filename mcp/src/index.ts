@@ -5,7 +5,8 @@ import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 
 const addr = process.env.MCP_HTTP_ADDR || "0.0.0.0:3333";
-const coreGrpc = process.env.CORE_GRPC_ADDR || "llm-core:9090";
+const coreGrpc = process.env.CORE_GRPC_ADDR || "llmcore:9090";
+const coreHttp = process.env.CORE_HTTP_URL || "http://llmcore:8080";
 const protoPathEnv = process.env.PROTO_PATH;
 
 const __filename = fileURLToPath(import.meta.url);
@@ -35,6 +36,42 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 function sendJson(res: http.ServerResponse, status: number, payload: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(payload));
+}
+
+// Проксирование HTTP-запросов к llm-core
+function proxyToCore(
+  coreUrl: string,
+  method: string,
+  body: string | null,
+  res: http.ServerResponse
+) {
+  const url = new URL(coreUrl);
+  const opts: http.RequestOptions = {
+    hostname: url.hostname,
+    port: url.port,
+    path: url.pathname + url.search,
+    method,
+    headers: { "content-type": "application/json" },
+  };
+
+  const proxyReq = http.request(opts, (proxyRes) => {
+    const chunks: Buffer[] = [];
+    proxyRes.on("data", (c) => chunks.push(c));
+    proxyRes.on("end", () => {
+      const data = Buffer.concat(chunks).toString("utf-8");
+      res.writeHead(proxyRes.statusCode ?? 502, {
+        "content-type": proxyRes.headers["content-type"] || "application/json",
+      });
+      res.end(data);
+    });
+  });
+
+  proxyReq.on("error", (err) => {
+    sendJson(res, 502, { error: `core unavailable: ${err.message}` });
+  });
+
+  if (body) proxyReq.write(body);
+  proxyReq.end();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -120,6 +157,39 @@ const server = http.createServer(async (req, res) => {
       }
       sendJson(res, 200, resp.job || {});
     });
+    return;
+  }
+
+  // Проксирование: умный LLM-роутинг через core
+  if (req.url === "/llm/request" && req.method === "POST") {
+    const raw = await readBody(req);
+    proxyToCore(`${coreHttp}/v1/llm/request`, "POST", raw, res);
+    return;
+  }
+
+  // Проксирование: дашборд
+  if (req.url === "/dashboard" && req.method === "GET") {
+    proxyToCore(`${coreHttp}/v1/dashboard`, "GET", null, res);
+    return;
+  }
+
+  // Проксирование: статистика расходов
+  if (req.url.startsWith("/costs/summary") && req.method === "GET") {
+    const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    proxyToCore(`${coreHttp}/v1/costs/summary${qs}`, "GET", null, res);
+    return;
+  }
+
+  // Проксирование: бенчмарки
+  if (req.url.startsWith("/benchmarks") && req.method === "GET") {
+    const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    proxyToCore(`${coreHttp}/v1/benchmarks${qs}`, "GET", null, res);
+    return;
+  }
+
+  // Проксирование: discovery (устройства)
+  if (req.url === "/discovery" && req.method === "GET") {
+    proxyToCore(`${coreHttp}/v1/discovery`, "GET", null, res);
     return;
   }
 

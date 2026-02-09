@@ -1,8 +1,19 @@
-import json
+"""LLM Telemetry — alert-only мониторинг.
+
+Вместо полного ASCII-дашборда каждые 2 сек, теперь:
+- Проверяет состояние каждые CHECK_INTERVAL секунд (по умолчанию 30)
+- Отправляет Telegram-уведомления только при проблемах:
+  - Устройство перешло в offline
+  - Job failed > N раз (ALERT_FAIL_THRESHOLD)
+  - Очередь застряла (queued > 0, running = 0)
+  - Устройство вернулось online (recovery)
+- Визуализация перенесена на web UI (/llm страница в telegram-mcp)
+"""
+
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 import psycopg
 from psycopg.rows import dict_row
@@ -37,229 +48,85 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _parse_json(value):
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return json.loads(value.decode("utf-8"))
-        except Exception:
-            return {}
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except Exception:
-            return {}
-    return {}
-
-
-def _format_duration(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    minutes, sec = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}h{minutes:02d}m"
-    if minutes > 0:
-        return f"{minutes}m{sec:02d}s"
-    return f"{sec}s"
-
-
-def _format_ts(dt):
-    if not dt:
-        return "-"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    local = dt.astimezone()
-    return local.strftime("%H:%M:%S")
-
-
-def _trim(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)] + "..."
-
-
-def _bar(value: int, total: int, width: int = 12) -> str:
-    if total <= 0:
-        total = 1
-    value = max(0, min(value, total))
-    filled = int(round((value / total) * width))
-    filled = max(0, min(filled, width))
-    return "[" + ("#" * filled) + ("." * (width - filled)) + "]"
-
-
-def _fetch_snapshot(conn, running_limit: int, device_limit: int) -> dict:
-    snapshot = {
-        "jobs": {},
-        "benchmarks": {},
-        "running_jobs": [],
-        "devices": [],
-        "device_models": {},
-        "device_load": {},
+def _fetch_alerts(conn, fail_threshold: int) -> dict:
+    """Собирает данные для алертов из БД."""
+    alerts = {
+        "devices_offline": [],
+        "devices_online": [],
+        "queue_stuck": False,
+        "failed_jobs": [],
+        "queued": 0,
+        "running": 0,
     }
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status")
-        snapshot["jobs"] = {row["status"]: row["count"] for row in cur.fetchall()}
+        jobs = {row["status"]: row["count"] for row in cur.fetchall()}
+        alerts["queued"] = jobs.get("queued", 0)
+        alerts["running"] = jobs.get("running", 0)
 
-        cur.execute(
-            "SELECT status, COUNT(*) AS count FROM jobs WHERE kind = 'benchmark' GROUP BY status"
-        )
-        snapshot["benchmarks"] = {row["status"]: row["count"] for row in cur.fetchall()}
+        if alerts["queued"] > 0 and alerts["running"] == 0:
+            alerts["queue_stuck"] = True
 
-        cur.execute(
-            """
-            SELECT id, kind, payload, updated_at, queued_at, attempts, max_attempts
-            FROM jobs
-            WHERE status = 'running'
-            ORDER BY updated_at DESC
-            LIMIT %s
-            """,
-            (running_limit,),
-        )
-        snapshot["running_jobs"] = cur.fetchall()
-
-        cur.execute(
-            """
-            SELECT payload->>'device_id' AS device_id, COUNT(*) AS count
-            FROM jobs
-            WHERE status = 'running' AND payload ? 'device_id'
-            GROUP BY 1
-            """
-        )
-        snapshot["device_load"] = {row["device_id"]: row["count"] for row in cur.fetchall() if row["device_id"]}
-
-        cur.execute(
-            """
-            SELECT device_id, COUNT(*) AS count
-            FROM device_models
-            WHERE available = TRUE
-            GROUP BY device_id
-            """
-        )
-        snapshot["device_models"] = {row["device_id"]: row["count"] for row in cur.fetchall() if row["device_id"]}
-
-        cur.execute(
-            """
-            SELECT id, name, status, last_seen, tags
+        cur.execute("""
+            SELECT id, name, status, last_seen
             FROM devices
             WHERE COALESCE(tags->>'ollama', 'false') = 'true'
-              AND (tags ? 'ips' OR tags ? 'dns' OR tags ? 'ip')
-            ORDER BY status DESC, name ASC
-            """
-        )
-        rows = cur.fetchall()
-        devices = []
-        for row in rows:
-            tags = _parse_json(row.get("tags"))
-            devices.append(
-                {
-                    "id": row.get("id"),
-                    "name": row.get("name") or row.get("id"),
-                    "status": row.get("status"),
-                    "last_seen": row.get("last_seen"),
-                    "tags": tags,
-                }
-            )
-        if device_limit > 0:
-            devices = devices[:device_limit]
-        snapshot["devices"] = devices
-    return snapshot
+            ORDER BY name ASC
+        """)
+        for row in cur.fetchall():
+            dev = {
+                "id": row.get("id"),
+                "name": row.get("name") or row.get("id"),
+                "status": row.get("status"),
+            }
+            if dev["status"] == "offline":
+                alerts["devices_offline"].append(dev)
+            elif dev["status"] == "online":
+                alerts["devices_online"].append(dev)
+
+        cur.execute("""
+            SELECT id, kind, error, attempts, max_attempts
+            FROM jobs
+            WHERE status = 'error'
+              AND updated_at > now() - interval '1 hour'
+              AND attempts >= %s
+            ORDER BY updated_at DESC
+            LIMIT 5
+        """, (fail_threshold,))
+        alerts["failed_jobs"] = cur.fetchall()
+
+    return alerts
 
 
-def _format_snapshot(snapshot: dict, spinner: str, max_len: int) -> str:
-    now = datetime.now().astimezone()
+def _format_alert(alerts: dict, prev_offline: set[str]) -> str | None:
+    """Формирует текст алерта. Возвращает None если алертов нет."""
     lines: list[str] = []
-    lines.append(f"{spinner} LLM-MCP  {now.strftime('%H:%M:%S')}")
 
-    jobs = snapshot.get("jobs", {})
-    queued = jobs.get("queued", 0)
-    running = jobs.get("running", 0)
-    done = jobs.get("done", 0)
-    failed = jobs.get("failed", 0)
-    total_jobs = queued + running + done + failed
-    lines.append(f"⚙ Q {_bar(done, total_jobs, 10)} q{queued} r{running} d{done} f{failed}")
+    current_offline = {d["id"] for d in alerts["devices_offline"]}
+    new_offline = current_offline - prev_offline
+    for dev in alerts["devices_offline"]:
+        if dev["id"] in new_offline:
+            lines.append(f"OFFLINE: {dev['name']}")
 
-    bench = snapshot.get("benchmarks", {})
-    if bench:
-        bq = bench.get("queued", 0)
-        br = bench.get("running", 0)
-        bd = bench.get("done", 0)
-        bf = bench.get("failed", 0)
-        total_b = bq + br + bd + bf
-        lines.append(f"🏁 B {_bar(bd, total_b, 10)} q{bq} r{br} d{bd} f{bf}")
+    recovered = prev_offline - current_offline
+    online_map = {d["id"]: d for d in alerts["devices_online"]}
+    for dev_id in recovered:
+        name = online_map.get(dev_id, {}).get("name", dev_id)
+        lines.append(f"ONLINE: {name}")
 
-    devices = snapshot.get("devices", [])
-    device_models = snapshot.get("device_models", {})
-    device_load = snapshot.get("device_load", {})
+    if alerts["queue_stuck"]:
+        lines.append(f"Queue stuck: {alerts['queued']} queued, 0 running")
 
-    if devices:
-        lines.append("🤖 FLEET")
-        count = 0
-        for dev in devices:
-            tags = dev.get("tags", {})
-            models_count = device_models.get(dev["id"]) or len(tags.get("models", []) or [])
-            if models_count <= 0:
-                continue
-            latency = tags.get("ollama_latency_ms")
-            load = device_load.get(dev["id"], 0)
-            status = dev.get("status") or "unknown"
-            last_seen = _format_ts(dev.get("last_seen")) if status != "online" else ""
-            latency_str = f"{latency}ms" if latency is not None else "--"
-            name = dev["name"]
-            if len(name) > 12:
-                name = name[:9] + "..."
-            badge = "🟢" if status == "online" else ("🔴" if status == "offline" else "🟡")
-            line = f"{badge} {name:<12} 📦{models_count:<2} 🔥{load:<2}"
-            if latency is not None:
-                line += f" ⏱{latency_str}"
-            if last_seen:
-                line += f" last={last_seen}"
-            lines.append(_trim(line, 120))
-            count += 1
-            if count >= 8:
-                break
-        lines.append("—" * 22)
+    for job in alerts["failed_jobs"]:
+        error = (job.get("error") or "unknown")[:80]
+        lines.append(f"Job failed: {job['kind']} ({job['attempts']}/{job['max_attempts']}) - {error}")
 
-    running_jobs = snapshot.get("running_jobs", [])
-    if running_jobs:
-        lines.append("▶ Running")
-        device_names = {d["id"]: d["name"] for d in devices if d.get("id")}
-        now_ts = datetime.now(timezone.utc)
-        for idx, row in enumerate(running_jobs[:6], start=1):
-            payload = _parse_json(row.get("payload"))
-            model = payload.get("model") or payload.get("model_id") or "-"
-            provider = payload.get("provider") or ""
-            task_type = payload.get("task_type") or ""
-            device_id = payload.get("device_id") or ""
-            device_name = device_names.get(device_id, device_id or "cloud")
-            updated_at = row.get("updated_at") or row.get("queued_at")
-            age = ""
-            if updated_at:
-                if updated_at.tzinfo is None:
-                    updated_at = updated_at.replace(tzinfo=timezone.utc)
-                age = _format_duration((now_ts - updated_at).total_seconds())
-            kind = row.get("kind") or ""
-            if "benchmark" in kind:
-                tag = "🏁"
-            elif "embed" in kind:
-                tag = "🧩"
-            elif "generate" in kind or "chat" in kind:
-                tag = "💬"
-            else:
-                tag = "⚡"
-            if len(device_name) > 12:
-                device_name = device_name[:9] + "..."
-            short_model = model if len(model) <= 14 else model[:11] + "..."
-            line = f"{tag} {short_model} @ {device_name} {age}"
-            lines.append(_trim(line, 160))
-    else:
-        lines.append("▶ Running: —")
+    if not lines:
+        return None
 
-    text = "\n".join(lines)
-    return _trim(text, max_len)
+    now = datetime.now().astimezone()
+    header = f"LLM Alert  {now.strftime('%H:%M:%S')}"
+    return header + "\n" + "\n".join(lines)
 
 
 def main() -> None:
@@ -274,12 +141,8 @@ def main() -> None:
         log.error("DB_DSN (or TELEMETRY_DB_DSN) is required")
         return
 
-    update_interval = _env_float("TELEGRAM_UPDATE_INTERVAL", 2.0)
-    running_limit = _env_int("TELEMETRY_RUNNING_LIMIT", 6)
-    device_limit = _env_int("TELEMETRY_DEVICE_LIMIT", 20)
-    max_len = _env_int("TELEMETRY_MAX_LEN", 3800)
-    spinner = ["|", "/", "-", "\\"]
-    spin_idx = 0
+    check_interval = _env_float("TELEMETRY_CHECK_INTERVAL", 30.0)
+    fail_threshold = _env_int("ALERT_FAIL_THRESHOLD", 3)
 
     mcp_client, direct_client = tg_cfg.build_clients()
     if tg_cfg.use_mcp and mcp_client is None and not (tg_cfg.fallback_direct and direct_client is not None):
@@ -287,8 +150,11 @@ def main() -> None:
         return
 
     conn = None
-    last_text = ""
-    last_send = 0.0
+    prev_offline: set[str] = set()
+    seen_failed: set[str] = set()
+    first_run = True
+
+    log.info("alert-only mode started (interval=%.0fs, fail_threshold=%d)", check_interval, fail_threshold)
 
     while True:
         if conn is None or conn.closed:
@@ -298,52 +164,60 @@ def main() -> None:
                 log.info("db connected")
             except Exception as exc:
                 log.warning("db connect failed err=%s", exc)
-                time.sleep(2)
+                time.sleep(5)
                 continue
 
         try:
-            snapshot = _fetch_snapshot(conn, running_limit, device_limit)
-            spin = spinner[spin_idx % len(spinner)]
-            spin_idx += 1
-            text = _format_snapshot(snapshot, spin, max_len)
-            now = time.time()
-            should_send = False
-            if text != last_text:
-                should_send = True
-            elif now - last_send >= update_interval:
-                should_send = True
-            if should_send:
-                sent = False
-                route = "none"
+            alerts = _fetch_alerts(conn, fail_threshold)
+            current_offline = {d["id"] for d in alerts["devices_offline"]}
 
+            # Фильтруем уже отправленные failed jobs
+            new_failed = [j for j in alerts["failed_jobs"] if j["id"] not in seen_failed]
+            alerts["failed_jobs"] = new_failed
+
+            if first_run:
+                prev_offline = current_offline
+                seen_failed = {j["id"] for j in alerts["failed_jobs"]}
+                first_run = False
+                log.info("baseline: devices_offline=%d queued=%d running=%d",
+                         len(current_offline), alerts["queued"], alerts["running"])
+                time.sleep(check_interval)
+                continue
+
+            text = _format_alert(alerts, prev_offline)
+            prev_offline = current_offline
+            # Запоминаем отправленные job id
+            for j in new_failed:
+                seen_failed.add(j["id"])
+            # Чистим seen_failed от старых
+            if len(seen_failed) > 100:
+                seen_failed = {j["id"] for j in alerts["failed_jobs"]}
+
+            if text:
+                sent = False
                 if mcp_client is not None:
                     try:
                         sent = mcp_client.send_or_edit(text)
-                        route = "mcp"
                     except Exception as exc:
                         log.warning("telegram mcp send failed err=%s", exc)
                         sent = False
 
                 if not sent and tg_cfg.fallback_direct and direct_client is not None:
                     sent = direct_client.send_or_edit(text)
-                    route = "direct-fallback"
 
                 if sent:
-                    last_text = text
-                    last_send = now
-                    log.info(
-                        "tick route=%s queued=%s running=%s devices=%s",
-                        route,
-                        snapshot.get("jobs", {}).get("queued", 0),
-                        snapshot.get("jobs", {}).get("running", 0),
-                        len(snapshot.get("devices", [])),
-                    )
+                    log.info("alert sent: %s", text.replace('\n', ' | '))
                 else:
-                    log.warning("telegram send skipped (all routes failed)")
+                    log.warning("alert send failed (all routes)")
+            else:
+                log.info("tick: no alerts (offline=%d queued=%d running=%d)",
+                         len(current_offline), alerts["queued"], alerts["running"])
+
         except Exception as exc:
             log.warning("telemetry loop error err=%s", exc)
-            time.sleep(1)
-        time.sleep(update_interval)
+            time.sleep(5)
+
+        time.sleep(check_interval)
 
 
 if __name__ == "__main__":

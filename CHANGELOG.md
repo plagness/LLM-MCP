@@ -1,5 +1,39 @@
 # Changelog
 
+## [2026.02.7] - 2026-02-09
+
+### Tier 1 — Новые эндпоинты и запись расходов
+
+- **Запись actual cost**: worker парсит `usage` (prompt_tokens/completion_tokens) из ответов OpenAI/OpenRouter; core записывает стоимость в `llm_costs` через SQL-функцию `calculate_job_cost()`.
+- **`GET /v1/costs/summary?period=day|week|month`**: агрегированная статистика расходов с группировкой по провайдерам.
+- **`GET /v1/dashboard`**: полный snapshot системы в одном JSON — jobs, costs, devices, running_jobs, models_count, benchmarks.
+- **MCP proxy**: добавлены 5 HTTP-прокси через llmmcp → llmcore: `/llm/request`, `/dashboard`, `/costs/summary`, `/benchmarks`, `/discovery`.
+
+### Tier 2 — Рефакторинг и Web UI
+
+- **Рефакторинг core**: `main.go` (1856 строк) разбит на 5 пакетов:
+  - `internal/config` — конфигурация и env-хелперы
+  - `internal/models` — все типы данных
+  - `internal/routing` — маршрутизация LLM-запросов, выбор устройств
+  - `internal/limits` — лимиты устройств, валидация моделей
+  - `internal/api` — HTTP-хендлеры, SSE, helpers
+  - `cmd/core/main.go` — только инициализация (~115 строк)
+- **Retry с backoff в worker**: `_post_json()` поддерживает 3 попытки с exponential backoff (1s/2s/4s), не ретраит 4xx (кроме 429).
+- **LLM дашборд в telegram-mcp web UI**: новый тип страницы `llm` (`/p/llm`) — Job Queue, Costs, Fleet, Running Jobs, Models; автообновление каждые 5 сек; server-side fetch из llmcore.
+- **Telemetry → alert-only**: вместо полного ASCII-дашборда каждые 2 сек → проверка каждые 30 сек, уведомления только при проблемах (device offline/recovery, queue stuck, job failed). Дедупликация алертов.
+
+### Tier 3 — Производительность
+
+- **LISTEN/NOTIFY для SSE**: PostgreSQL trigger `trg_job_status_notify` уведомляет при смене статуса задачи; `handleJobStream` использует `LISTEN job_update` + `WaitForNotification` вместо polling 1/сек. Fallback poll 15 сек на случай пропущенного notify.
+- **CTE в handleWorkerClaim**: заменён correlated subquery на CTE `running_per_device` с LEFT JOIN — O(1) агрегация вместо O(N×M).
+- **Discovery graceful fallback**: `tailscaleAvailable()` проверяет наличие binary через `LookPath`; при отсутствии Tailscale — warning + продолжение (subnet scan работает независимо). Лог `tailscale=true/false`.
+
+### Исправления
+
+- Дефолт `CORE_HTTP_URL` в MCP-адаптере: `llm-core` → `llmcore` (соответствует имени контейнера).
+- `CORE_HTTP_URL` добавлен в compose.yml для llmmcp.
+- Миграция `03_notify_trigger.sql` с триггером и функцией `notify_job_status_change()`.
+
 ## [2026.02.6] - 2026-02-07
 
 - `telemetry/llm_telemetry/telegram_gateway.py`:

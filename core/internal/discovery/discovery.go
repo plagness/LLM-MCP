@@ -68,60 +68,110 @@ func (r *Runner) setLastRun(t time.Time) {
 	r.mu.Unlock()
 }
 
+// tailscaleAvailable проверяет доступность tailscale binary
+func tailscaleAvailable() bool {
+	_, err := exec.LookPath("tailscale")
+	return err == nil
+}
+
 func (r *Runner) Run(ctx context.Context) error {
 	start := time.Now()
 	log.Printf("discovery: start")
-	out, err := exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
-	if err != nil {
-		log.Printf("discovery: tailscale status error: %v", err)
-		return err
-	}
+
+	hasTailscale := tailscaleAvailable()
 	var status tailStatus
-	if err := json.Unmarshal(out, &status); err != nil {
-		log.Printf("discovery: json parse error: %v", err)
-		return err
-	}
-
 	count := 0
-	processNode := func(node tailNode) {
-		id := node.DNSName
-		if id == "" {
-			id = node.HostName
+
+	if hasTailscale {
+		out, err := exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
+		if err != nil {
+			log.Printf("discovery: tailscale status error (continuing without): %v", err)
+		} else if err := json.Unmarshal(out, &status); err != nil {
+			log.Printf("discovery: tailscale json parse error (continuing without): %v", err)
+		} else {
+			processNode := func(node tailNode) {
+				id := node.DNSName
+				if id == "" {
+					id = node.HostName
+				}
+				if id == "" {
+					return
+				}
+				ip := ""
+				if len(node.TailscaleIPs) > 0 {
+					ip = node.TailscaleIPs[0]
+				}
+				addrs := buildAddrs(node)
+				hostHeaders := buildHostHeaders(node)
+				if err := r.upsertDevice(ctx, id, node, ip, addrs, hostHeaders); err != nil {
+					log.Printf("discovery: upsert error id=%s err=%v", id, err)
+					return
+				}
+				if node.Online {
+					r.probeOllama(ctx, id, addrs, hostHeaders)
+				}
+				count++
+			}
+
+			processNode(status.Self)
+			for _, node := range status.Peer {
+				processNode(node)
+			}
 		}
-		if id == "" {
-			return
-		}
-		ip := ""
-		if len(node.TailscaleIPs) > 0 {
-			ip = node.TailscaleIPs[0]
-		}
-		addrs := buildAddrs(node)
-		hostHeaders := buildHostHeaders(node)
-		if err := r.upsertDevice(ctx, id, node, ip, addrs, hostHeaders); err != nil {
-			log.Printf("discovery: upsert error id=%s err=%v", id, err)
-			return
-		}
-		if node.Online {
-			r.probeOllama(ctx, id, addrs, hostHeaders)
-		}
-		count++
+	} else {
+		log.Printf("discovery: tailscale not found, skipping mesh discovery")
 	}
 
-	// Сначала обрабатываем собственный узел, затем peers.
-	processNode(status.Self)
-	for _, node := range status.Peer {
-		processNode(node)
-	}
-
+	// Subnet scan работает независимо от Tailscale
 	if os.Getenv("DISCOVERY_SCAN_SUBNETS") == "1" {
-		r.scanSubnets(ctx, status.Self)
+		if hasTailscale && status.Self.HostName != "" {
+			r.scanSubnets(ctx, status.Self)
+		} else {
+			// Subnet scan по DISCOVERY_SUBNETS env без Tailscale self-node
+			r.scanSubnets(ctx, tailNode{})
+		}
 	} else {
 		r.clearLanDevices(ctx)
 	}
 
+	// Обработка offline устройств (только если Tailscale доступен)
+	offlineIDs := []string{}
+	if hasTailscale && status.Self.HostName != "" {
+		offlineIDs = r.collectOfflineDeviceIDs(ctx, status)
+		if len(offlineIDs) > 0 {
+			if err := HandleOfflineDevices(ctx, r.DB, offlineIDs); err != nil {
+				log.Printf("discovery: offline handler error: %v", err)
+			}
+		}
+	}
+
 	r.setLastRun(time.Now())
-	log.Printf("discovery: done peers=%d elapsed=%s", count, time.Since(start))
+	log.Printf("discovery: done peers=%d offline=%d tailscale=%v elapsed=%s", count, len(offlineIDs), hasTailscale, time.Since(start))
 	return nil
+}
+
+// collectOfflineDeviceIDs собирает ID всех offline устройств из Tailscale status
+func (r *Runner) collectOfflineDeviceIDs(ctx context.Context, status tailStatus) []string {
+	offlineIDs := []string{}
+
+	check := func(node tailNode) {
+		if !node.Online {
+			id := node.DNSName
+			if id == "" {
+				id = node.HostName
+			}
+			if id != "" {
+				offlineIDs = append(offlineIDs, id)
+			}
+		}
+	}
+
+	check(status.Self)
+	for _, node := range status.Peer {
+		check(node)
+	}
+
+	return offlineIDs
 }
 
 func (r *Runner) upsertDevice(ctx context.Context, id string, node tailNode, ip string, addrs []string, hostHeaders []string) error {

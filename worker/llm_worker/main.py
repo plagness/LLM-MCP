@@ -109,17 +109,33 @@ def _parse_payload(raw: str) -> dict:
         return {}
 
 
-def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 120):
+def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 120, retries: int = 3):
+    """HTTP POST с exponential backoff retry для transient ошибок."""
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", **(headers or {})},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        return resp.status, body
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json", **(headers or {})},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, body
+        except urllib.error.HTTPError as exc:
+            # 4xx — не ретраим (ошибка клиента), кроме 429 (rate limit)
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise
+            last_exc = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+        if attempt < retries - 1:
+            delay = min(2 ** attempt, 10)
+            log.warning("_post_json retry %d/%d url=%s delay=%ds err=%s", attempt + 1, retries, url, delay, last_exc)
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 def _format_addr(addr: str) -> str:
@@ -202,6 +218,16 @@ def _ollama_embed(payload: dict):
     return {"status": status, "ms": ms, "data": data}
 
 
+def _extract_usage(data: dict) -> dict:
+    """Извлекает usage (токены) из ответа OpenAI/OpenRouter."""
+    usage = data.get("usage") or {}
+    return {
+        "tokens_in": int(usage.get("prompt_tokens") or 0),
+        "tokens_out": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+
+
 def _openai_chat(payload: dict):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -225,8 +251,9 @@ def _openai_chat(payload: dict):
     )
     ms = int((time.perf_counter() - t0) * 1000)
     data = json.loads(body) if body else {}
-    log.info("openai.chat done status=%s ms=%s", status, ms)
-    return {"status": status, "ms": ms, "data": data}
+    usage = _extract_usage(data)
+    log.info("openai.chat done status=%s ms=%s tokens_in=%d tokens_out=%d", status, ms, usage["tokens_in"], usage["tokens_out"])
+    return {"status": status, "ms": ms, "data": data, "usage": usage, "model": model, "provider": "openai"}
 
 
 def _openrouter_chat(payload: dict):
@@ -252,8 +279,9 @@ def _openrouter_chat(payload: dict):
     )
     ms = int((time.perf_counter() - t0) * 1000)
     data = json.loads(body) if body else {}
-    log.info("openrouter.chat done status=%s ms=%s", status, ms)
-    return {"status": status, "ms": ms, "data": data}
+    usage = _extract_usage(data)
+    log.info("openrouter.chat done status=%s ms=%s tokens_in=%d tokens_out=%d", status, ms, usage["tokens_in"], usage["tokens_out"])
+    return {"status": status, "ms": ms, "data": data, "usage": usage, "model": model, "provider": "openrouter"}
 
 
 def _handle_job(kind: str, payload: dict) -> tuple[dict, dict]:
@@ -269,10 +297,24 @@ def _handle_job(kind: str, payload: dict) -> tuple[dict, dict]:
         return _benchmark_ollama_embed(payload)
     if kind == "openai.chat":
         resp = _openai_chat(payload)
-        return {"ok": True, "provider": "openai", "data": resp["data"]}, {"ms": resp["ms"]}
+        usage = resp.get("usage", {})
+        return {"ok": True, "provider": "openai", "data": resp["data"]}, {
+            "ms": resp["ms"],
+            "model": resp.get("model", ""),
+            "provider": "openai",
+            "tokens_in": usage.get("tokens_in", 0),
+            "tokens_out": usage.get("tokens_out", 0),
+        }
     if kind == "openrouter.chat":
         resp = _openrouter_chat(payload)
-        return {"ok": True, "provider": "openrouter", "data": resp["data"]}, {"ms": resp["ms"]}
+        usage = resp.get("usage", {})
+        return {"ok": True, "provider": "openrouter", "data": resp["data"]}, {
+            "ms": resp["ms"],
+            "model": resp.get("model", ""),
+            "provider": "openrouter",
+            "tokens_in": usage.get("tokens_in", 0),
+            "tokens_out": usage.get("tokens_out", 0),
+        }
 
     return {"ok": True, "echo": payload}, {"ms": 0}
 

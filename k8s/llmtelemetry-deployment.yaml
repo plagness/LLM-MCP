@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmtelemetry
+  namespace: ns-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llmtelemetry
+  template:
+    metadata:
+      labels:
+        app: llmtelemetry
+    spec:
+      # Инициализация: ожидание готовности llmcore
+      initContainers:
+      - name: wait-for-core
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          until curl -f http://llmcore:8080/health; do
+            echo "Waiting for llmcore...";
+            sleep 2;
+          done
+      containers:
+      - name: llmtelemetry
+        image: llm-mcp-llmtelemetry:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_DSN
+          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_HOST
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_PORT
+        - name: DB_USER
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: DB_PASSWORD
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_NAME
+        - name: TELEGRAM_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: TELEGRAM_BOT_TOKEN
+        - name: TELEGRAM_CHAT_ID
+          value: ""  # Укажите ID чата для уведомлений
+        - name: TELEGRAM_UPDATE_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: TELEGRAM_UPDATE_INTERVAL
+        - name: TELEGRAM_USE_MCP
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: TELEGRAM_USE_MCP
+        - name: TELEGRAM_MCP_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: TGAPI_URL
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: LOG_LEVEL
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

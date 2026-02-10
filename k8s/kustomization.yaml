@@ -1,0 +1,39 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Namespace для всех ресурсов
+namespace: ns-llm
+
+# Список ресурсов для развёртывания
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - configmap.yaml
+  - llmdb-pvc.yaml
+  - llmdb-statefulset.yaml
+  - llmdb-service.yaml
+  - llmcore-deployment.yaml
+  - llmcore-service.yaml
+  - llmworker-deployment.yaml
+  - llmtelemetry-deployment.yaml
+  - llmmcp-deployment.yaml
+  - llmmcp-service.yaml
+  # Ollama (опционально — раскомментировать при деплое на ноде с GPU/CPU)
+  # - ollama-deployment.yaml
+  # - ollama-service.yaml
+
+# Общие метки для всех ресурсов
+commonLabels:
+  project: neuronswarm
+  module: llm-mcp
+
+# Общие аннотации
+commonAnnotations:
+  maintainer: "plag"
+  description: "LLM MCP module for NeuronSwarm"
+
+# Генераторы ConfigMap и Secret
+# (уже определены явно в файлах выше)
+
+# Порядок развёртывания не гарантируется Kustomize,
+# зависимости управляются через initContainers

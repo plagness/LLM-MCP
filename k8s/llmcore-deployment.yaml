@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmcore
+  namespace: ns-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llmcore
+  template:
+    metadata:
+      labels:
+        app: llmcore
+    spec:
+      # Инициализация: ожидание готовности БД
+      initContainers:
+      - name: wait-for-db
+        image: postgres:16-alpine
+        command:
+        - sh
+        - -c
+        - |
+          until pg_isready -h llmdb -p 5432 -U llm; do
+            echo "Waiting for database...";
+            sleep 2;
+          done
+      containers:
+      - name: llmcore
+        image: llm-mcp-llmcore:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 9090
+          name: grpc
+          protocol: TCP
+        env:
+        - name: CORE_HTTP_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: CORE_HTTP_ADDR
+        - name: CORE_GRPC_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: CORE_GRPC_ADDR
+        - name: DB_DSN
+          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_HOST
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_PORT
+        - name: DB_USER
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: DB_PASSWORD
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DB_NAME
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: OPENAI_API_KEY
+        - name: OPENROUTER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: OPENROUTER_API_KEY
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: LOG_LEVEL
+        volumeMounts:
+        # Tailscale binary для сетевого взаимодействия
+        - name: tailscale-bin
+          mountPath: /usr/bin/tailscale
+          readOnly: true
+        - name: tailscale-sock
+          mountPath: /var/run/tailscale/tailscaled.sock
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: tailscale-bin
+        hostPath:
+          path: /usr/bin/tailscale
+          type: File
+      - name: tailscale-sock
+        hostPath:
+          path: /var/run/tailscale/tailscaled.sock
+          type: Socket

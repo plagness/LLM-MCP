@@ -1,0 +1,61 @@
+# Ollama Deployment — локальный LLM inference
+# nodeSelector: привязка к конкретной ноде (VDS или Pi5)
+# Для multi-instance: создать несколько Deployment с разными портами и nodeSelector
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ns-llm
+  labels:
+    app: ollama
+    component: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+        component: inference
+    spec:
+      # nodeSelector для привязки к VDS ноде:
+      # nodeSelector:
+      #   kubernetes.io/hostname: your-node-name
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 11434
+          name: ollama-api
+        env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "3Gi"
+        livenessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - name: ollama-models
+          mountPath: /root/.ollama
+      volumes:
+      - name: ollama-models
+        hostPath:
+          path: /var/lib/ollama
+          type: DirectoryOrCreate

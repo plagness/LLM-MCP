@@ -1,0 +1,9 @@
+version: 2026.02.7
+source: openrouter
+updated_at: 2026-02-07
+models:
+  - id: moonshotai/kimi-k2.5
+  - id: minimax/minimax-m2.1
+  - id: x-ai/grok-code-fast-1
+  - id: z-ai/glm-4.7
+  - id: nvidia/nemotron-3-nano-30b-a3b

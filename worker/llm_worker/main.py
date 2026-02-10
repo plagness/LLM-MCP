@@ -139,9 +139,25 @@ def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: in
 
 
 def _format_addr(addr: str) -> str:
+    """Оборачивает IPv6-адрес в квадратные скобки для HTTP URL."""
     if ":" in addr and not addr.startswith("["):
         return f"[{addr}]"
     return addr
+
+
+def _split_host_port(addr: str) -> tuple[str, str]:
+    """Разделяет addr на (host, port). Возвращает (addr, '') если порт не указан."""
+    # IPv6 с портом: [::1]:11435
+    if addr.startswith("["):
+        idx = addr.find("]:")
+        if idx > 0:
+            return addr[1:idx], addr[idx + 2:]
+        return addr.strip("[]"), ""
+    # IPv4 с портом: 192.168.1.10:11435 — ровно одно двоеточие + цифры
+    parts = addr.rsplit(":", 1)
+    if len(parts) == 2 and parts[1].isdigit() and ":" not in parts[0]:
+        return parts[0], parts[1]
+    return addr, ""
 
 
 def _resolve_ollama_base(payload: dict) -> str:
@@ -153,6 +169,10 @@ def _resolve_ollama_base(payload: dict) -> str:
         addr = str(addr)
         if addr.startswith("http://") or addr.startswith("https://"):
             return addr.rstrip("/")
+        # Проверяем, содержит ли addr порт (формат ip:port от multi-port discovery)
+        host, port = _split_host_port(addr)
+        if port:
+            return f"http://{_format_addr(host)}:{port}"
         return f"http://{_format_addr(addr)}:11434"
     return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 

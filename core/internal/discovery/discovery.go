@@ -222,8 +222,43 @@ func (r *Runner) upsertDevice(ctx context.Context, id string, node tailNode, ip 
 	return err
 }
 
+// probeOllama пробирует Ollama на всех сконфигурированных портах (OLLAMA_PORTS)
 func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []string, hostHeaders []string) {
+	ports := getOllamaPorts()
+	for _, port := range ports {
+		portDeviceID := deviceID
+		if port != 11434 {
+			portDeviceID = deviceID + ":" + strconv.Itoa(port)
+			if err := r.ensurePortDevice(ctx, portDeviceID, deviceID, port); err != nil {
+				log.Printf("discovery: port device error id=%s err=%v", portDeviceID, err)
+				continue
+			}
+		}
+		r.probeOllamaPort(ctx, portDeviceID, addrs, hostHeaders, port)
+	}
+}
+
+// ensurePortDevice создаёт запись устройства для не-default порта,
+// копируя базовые поля из родительского устройства
+func (r *Runner) ensurePortDevice(ctx context.Context, portDeviceID, baseDeviceID string, port int) error {
+	_, err := r.DB.Exec(ctx, `
+		INSERT INTO devices (id, name, platform, arch, host, tags, status, last_seen, updated_at)
+		SELECT $1, name || ':' || $3::text, platform, arch, host,
+		       jsonb_build_object('port_device', true, 'base_device', $2, 'ollama_port', $3),
+		       status, last_seen, now()
+		FROM devices WHERE id = $2
+		ON CONFLICT (id) DO UPDATE SET
+		  status = EXCLUDED.status,
+		  last_seen = EXCLUDED.last_seen,
+		  updated_at = now()
+	`, portDeviceID, baseDeviceID, port)
+	return err
+}
+
+// probeOllamaPort пробирует Ollama на конкретном порту
+func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []string, hostHeaders []string, port int) {
 	client := http.Client{Timeout: 2 * time.Second}
+	portStr := strconv.Itoa(port)
 	seen := map[string]bool{}
 	results := make([]map[string]any, 0, len(addrs))
 	bestAddr := ""
@@ -237,7 +272,7 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 			continue
 		}
 		seen[addr] = true
-		url := "http://" + formatAddr(addr) + ":11434/api/tags"
+		url := "http://" + formatAddr(addr) + ":" + portStr + "/api/tags"
 		attemptHosts := []string{""}
 		if net.ParseIP(addr) != nil {
 			attemptHosts = append(attemptHosts, hostHeaders...)
@@ -254,37 +289,37 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 			resp, err := client.Do(req)
 			latency := time.Since(start).Milliseconds()
 			if err != nil {
-				log.Printf("discovery: ollama probe fail device=%s addr=%s host=%s err=%v", deviceID, addr, host, err)
-				results = append(results, map[string]any{"addr": addr, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
+				log.Printf("discovery: ollama probe fail device=%s addr=%s port=%s host=%s err=%v", deviceID, addr, portStr, host, err)
+				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
 				continue
 			}
 			if resp.StatusCode != http.StatusOK {
-				log.Printf("discovery: ollama probe bad status device=%s addr=%s host=%s status=%d", deviceID, addr, host, resp.StatusCode)
+				log.Printf("discovery: ollama probe bad status device=%s addr=%s port=%s host=%s status=%d", deviceID, addr, portStr, host, resp.StatusCode)
 				_ = resp.Body.Close()
-				results = append(results, map[string]any{"addr": addr, "host": host, "ok": false, "latency_ms": latency, "status": resp.StatusCode})
+				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "status": resp.StatusCode})
 				continue
 			}
-		var data struct {
-			Models []ollamaModel `json:"models"`
-		}
+			var data struct {
+				Models []ollamaModel `json:"models"`
+			}
 			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 				_ = resp.Body.Close()
-				log.Printf("discovery: ollama decode error device=%s addr=%s host=%s err=%v", deviceID, addr, host, err)
-				results = append(results, map[string]any{"addr": addr, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
+				log.Printf("discovery: ollama decode error device=%s addr=%s port=%s host=%s err=%v", deviceID, addr, portStr, host, err)
+				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
 				continue
 			}
 			_ = resp.Body.Close()
-		models := []string{}
-		for _, m := range data.Models {
-			name := strings.TrimSpace(m.Name)
-			if name != "" {
-				models = append(models, name)
+			models := []string{}
+			for _, m := range data.Models {
+				name := strings.TrimSpace(m.Name)
+				if name != "" {
+					models = append(models, name)
+				}
 			}
-		}
-		if err := r.syncDeviceModels(ctx, deviceID, data.Models); err != nil {
-			log.Printf("discovery: model sync error device=%s err=%v", deviceID, err)
-		}
-			results = append(results, map[string]any{"addr": addr, "host": host, "ok": true, "latency_ms": latency, "models_count": len(models)})
+			if err := r.syncDeviceModels(ctx, deviceID, data.Models); err != nil {
+				log.Printf("discovery: model sync error device=%s err=%v", deviceID, err)
+			}
+			results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": true, "latency_ms": latency, "models_count": len(models)})
 			if bestAddr == "" || latency < bestLatency {
 				bestAddr = addr
 				bestLatency = latency
@@ -297,13 +332,18 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 	if bestAddr == "" {
 		return
 	}
+
+	// Хранить addr:port для всех портов (worker разберёт)
+	ollamaAddr := bestAddr + ":" + portStr
+
 	meta := map[string]any{
-		"ollama":           true,
-		"models":           bestModels,
-		"ollama_addr":      bestAddr,
+		"ollama":            true,
+		"models":            bestModels,
+		"ollama_addr":       ollamaAddr,
+		"ollama_port":       port,
 		"ollama_latency_ms": bestLatency,
-		"ollama_addrs":     results,
-		"ollama_host":      bestHost,
+		"ollama_addrs":      results,
+		"ollama_host":       bestHost,
 	}
 	metaJSON, _ := json.Marshal(meta)
 	_, err := r.DB.Exec(ctx, `
@@ -316,7 +356,7 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 		log.Printf("discovery: ollama update error device=%s err=%v", deviceID, err)
 		return
 	}
-	log.Printf("discovery: ollama ok device=%s addr=%s host=%s latency=%dms models=%d", deviceID, bestAddr, bestHost, bestLatency, len(bestModels))
+	log.Printf("discovery: ollama ok device=%s addr=%s port=%s host=%s latency=%dms models=%d", deviceID, ollamaAddr, portStr, bestHost, bestLatency, len(bestModels))
 }
 
 func formatAddr(addr string) string {
@@ -498,34 +538,42 @@ func (r *Runner) scanSubnets(ctx context.Context, self tailNode) {
 
 	worker := func() {
 		defer wg.Done()
+		ports := getOllamaPorts()
 		for j := range jobs {
-			url := "http://" + j.ip + ":11434/api/tags"
-			resp, err := client.Get(url)
-			if err != nil {
-				continue
-			}
-			if resp.StatusCode != http.StatusOK {
-				_ = resp.Body.Close()
-				continue
-			}
-			var data struct {
-				Models []struct {
-					Name string `json:"name"`
-				} `json:"models"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-				_ = resp.Body.Close()
-				continue
-			}
-			_ = resp.Body.Close()
-			models := []string{}
-			for _, m := range data.Models {
-				name := strings.TrimSpace(m.Name)
-				if name != "" {
-					models = append(models, name)
+			for _, port := range ports {
+				portStr := strconv.Itoa(port)
+				url := "http://" + j.ip + ":" + portStr + "/api/tags"
+				resp, err := client.Get(url)
+				if err != nil {
+					continue
 				}
+				if resp.StatusCode != http.StatusOK {
+					_ = resp.Body.Close()
+					continue
+				}
+				var data struct {
+					Models []struct {
+						Name string `json:"name"`
+					} `json:"models"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					_ = resp.Body.Close()
+					continue
+				}
+				_ = resp.Body.Close()
+				models := []string{}
+				for _, m := range data.Models {
+					name := strings.TrimSpace(m.Name)
+					if name != "" {
+						models = append(models, name)
+					}
+				}
+				lanID := j.ip
+				if port != 11434 {
+					lanID = j.ip + ":" + portStr
+				}
+				r.upsertLanDevice(ctx, lanID, models, port)
 			}
-			r.upsertLanDevice(ctx, j.ip, models)
 		}
 	}
 
@@ -611,12 +659,14 @@ func isPrivateIPv4(addr netip.Addr) bool {
 	}
 }
 
-func (r *Runner) upsertLanDevice(ctx context.Context, ip string, models []string) {
+func (r *Runner) upsertLanDevice(ctx context.Context, ip string, models []string, port int) {
 	id := "lan-" + ip
+	ollamaAddr := ip + ":" + strconv.Itoa(port)
 	meta := map[string]any{
 		"ip":          ip,
 		"ollama":      true,
-		"ollama_addr": ip,
+		"ollama_addr": ollamaAddr,
+		"ollama_port": port,
 		"models":      models,
 		"source":      "subnet",
 	}
@@ -645,6 +695,31 @@ func getEnv(key string) string {
 		return v
 	}
 	return ""
+}
+
+// getOllamaPorts парсит OLLAMA_PORTS env var, возвращает список портов для probe
+func getOllamaPorts() []int {
+	raw := strings.TrimSpace(os.Getenv("OLLAMA_PORTS"))
+	if raw == "" {
+		return []int{11434}
+	}
+	ports := []int{}
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		port, err := strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			log.Printf("discovery: invalid OLLAMA_PORTS value: %s", p)
+			continue
+		}
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 {
+		return []int{11434}
+	}
+	return ports
 }
 
 func ipv4Range(prefix netip.Prefix) (netip.Addr, netip.Addr) {

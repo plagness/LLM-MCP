@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-config
+  namespace: ns-llm
+data:
+  # Database configuration
+  DB_HOST: "llmdb"
+  DB_PORT: "5432"
+  DB_USER: "llm"
+  DB_NAME: "llm_mcp"
+
+  # Core service addresses
+  CORE_HTTP_ADDR: "0.0.0.0:8080"
+  CORE_GRPC_ADDR: "0.0.0.0:9090"
+  CORE_HTTP_URL: "http://llmcore:8080"
+
+  # MCP service configuration
+  MCP_HTTP_ADDR: "0.0.0.0:3333"
+  PROTO_PATH: "/app/proto/llm.proto"
+
+  # External services
+  OLLAMA_BASE_URL: "http://localhost:11434"
+  TGAPI_URL: "http://tgapi.ns-telegram.svc.cluster.local:8000"
+
+  # Telemetry configuration
+  TELEGRAM_UPDATE_INTERVAL: "2"
+  TELEGRAM_USE_MCP: "0"
+
+  # Logging
+  LOG_LEVEL: "info"

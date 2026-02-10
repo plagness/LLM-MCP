@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmmcp
+  namespace: ns-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llmmcp
+  template:
+    metadata:
+      labels:
+        app: llmmcp
+    spec:
+      # Инициализация: ожидание готовности llmcore
+      initContainers:
+      - name: wait-for-core
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          until curl -f http://llmcore:8080/health; do
+            echo "Waiting for llmcore...";
+            sleep 2;
+          done
+      containers:
+      - name: llmmcp
+        image: llm-mcp-llmmcp:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3333
+          name: http
+          protocol: TCP
+        env:
+        - name: CORE_GRPC_ADDR
+          value: "llmcore:9090"
+        - name: MCP_HTTP_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: MCP_HTTP_ADDR
+        - name: PROTO_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: PROTO_PATH
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: LOG_LEVEL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3333
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3333
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

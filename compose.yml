@@ -32,6 +32,7 @@ services:
       DEVICE_LIMITS_INTERVAL: ${DEVICE_LIMITS_INTERVAL}
       DEVICE_LIMITS_JSON: ${DEVICE_LIMITS_JSON}
       DEVICE_LIMITS_FILE: ${DEVICE_LIMITS_FILE}
+      OLLAMA_PORTS: ${OLLAMA_PORTS:-11434}
       DB_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@llmdb:5432/${POSTGRES_DB}?sslmode=disable
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
@@ -97,3 +98,58 @@ services:
       - "${PORT_MCP_LLM:-${MCP_HTTP_PORT:-3333}}:3333"
     depends_on:
       - llmcore
+
+  # === Ollama сервисы (опциональные, через profiles) ===
+
+  # Одиночный Ollama: docker compose --profile ollama up
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    labels:
+      - "ns.module=llm"
+      - "ns.component=ollama"
+    environment:
+      OLLAMA_HOST: "0.0.0.0"
+    ports:
+      - "${OLLAMA_PORT_1:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    profiles: [ollama, ollama-multi]
+
+  # Второй Ollama: docker compose --profile ollama-multi up
+  ollama-2:
+    image: ollama/ollama:latest
+    container_name: ollama-2
+    labels:
+      - "ns.module=llm"
+      - "ns.component=ollama"
+    environment:
+      OLLAMA_HOST: "0.0.0.0"
+    ports:
+      - "${OLLAMA_PORT_2:-11435}:11434"
+    volumes:
+      - ollama2_data:/root/.ollama
+    restart: unless-stopped
+    profiles: [ollama-multi]
+
+  # Третий Ollama: docker compose --profile ollama-multi up
+  ollama-3:
+    image: ollama/ollama:latest
+    container_name: ollama-3
+    labels:
+      - "ns.module=llm"
+      - "ns.component=ollama"
+    environment:
+      OLLAMA_HOST: "0.0.0.0"
+    ports:
+      - "${OLLAMA_PORT_3:-11436}:11434"
+    volumes:
+      - ollama3_data:/root/.ollama
+    restart: unless-stopped
+    profiles: [ollama-multi]
+
+volumes:
+  ollama_data:
+  ollama2_data:
+  ollama3_data:

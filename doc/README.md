@@ -178,7 +178,7 @@ curl -N http://127.0.0.1:8080/v1/jobs/{id}/stream
   "task_type": "generate",
   "prompt": "test",
   "runs": 1,
-  "device_id": "steamdeck.yak-mirfak.ts.net."
+  "device_id": "your-device.ts.net."
 }
 ```
 
@@ -196,7 +196,7 @@ curl -N http://127.0.0.1:8080/v1/jobs/{id}/stream
 ### 6) Устройства (сигналы от воркеров)
 **POST /v1/devices/offline** — пометить устройство как offline (например, при ошибке сети)
 ```json
-{"device_id":"steamdeck.yak-mirfak.ts.net.","reason":"connection refused"}
+{"device_id":"your-device.ts.net.","reason":"connection refused"}
 ```
 
 ---
@@ -206,14 +206,14 @@ curl -N http://127.0.0.1:8080/v1/jobs/{id}/stream
 ### `ollama.generate`
 Payload:
 ```json
-{"model":"llama3.2:1b","prompt":"...","options":{},"ollama_addr":"100.121.214.22","ollama_host":"steamdeck.yak-mirfak.ts.net"}
+{"model":"llama3.2:1b","prompt":"...","options":{},"ollama_addr":"100.64.0.1","ollama_host":"your-device.ts.net"}
 ```
 Результат: `result.data` содержит raw‑ответ Ollama `/api/generate`.
 
 ### `ollama.embed`
 Payload:
 ```json
-{"model":"nomic-embed-text","prompt":"...","ollama_addr":"100.121.214.22","ollama_host":"steamdeck.yak-mirfak.ts.net"}
+{"model":"nomic-embed-text","prompt":"...","ollama_addr":"100.64.0.1","ollama_host":"your-device.ts.net"}
 ```
 Результат: `result.data.embedding` (формат Ollama `/api/embeddings`).
 
@@ -343,9 +343,9 @@ Core выполняет `tailscale status --json`, обновляет табли
 ```json
 {
   "*": {"ram_gb": 16},
-  "pi5.yak-mirfak.ts.net.": {"ram_gb": 8},
-  "steamdeck.yak-mirfak.ts.net.": {"vram_gb": 16, "allow_models": ["llama3.2:3b", "qwen2.5:3b"]},
-  "macbook-pro-2021.yak-mirfak.ts.net.": {"ram_gb": 16, "deny_models": ["qwen3-vl:latest"]}
+  "device-a.ts.net.": {"ram_gb": 8},
+  "your-device.ts.net.": {"vram_gb": 16, "allow_models": ["llama3.2:3b", "qwen2.5:3b"]},
+  "device-c.ts.net.": {"ram_gb": 16, "deny_models": ["qwen3-vl:latest"]}
 }
 ```
 Правило авто‑подбора:

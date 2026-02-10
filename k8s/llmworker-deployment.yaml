@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmworker
+  namespace: ns-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llmworker
+  template:
+    metadata:
+      labels:
+        app: llmworker
+    spec:
+      # Использование hostNetwork для доступа к Ollama на хост-машине
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Инициализация: ожидание готовности llmcore
+      initContainers:
+      - name: wait-for-core
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          until curl -f http://llmcore:8080/health; do
+            echo "Waiting for llmcore...";
+            sleep 2;
+          done
+      containers:
+      - name: llmworker
+        image: llm-mcp-llmworker:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: CORE_GRPC_ADDR
+          value: "llmcore.ns-llm.svc.cluster.local:9090"
+        - name: CORE_HTTP_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: CORE_HTTP_URL
+        - name: OLLAMA_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: OLLAMA_BASE_URL
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: LOG_LEVEL
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+      # Альтернатива hostNetwork: hostAliases для маппинга Ollama
+      # hostAliases:
+      # - ip: "192.168.1.100"  # IP хост-машины
+      #   hostnames:
+      #   - "host.docker.internal"

@@ -25,7 +25,8 @@ data:
 
   # Telemetry configuration
   TELEGRAM_UPDATE_INTERVAL: "2"
-  TELEGRAM_USE_MCP: "0"
+  # Маршрутизация через telegram-mcp (многоботовая архитектура)
+  TELEGRAM_USE_MCP: "1"
 
   # Logging
   LOG_LEVEL: "info"

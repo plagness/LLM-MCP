@@ -25,6 +25,8 @@ resources:
 # Общие метки для всех ресурсов
 labels:
   - pairs:
+      app.kubernetes.io/part-of: neuronswarm
+      app.kubernetes.io/managed-by: kustomize
       project: neuronswarm
       module: llm-mcp
 

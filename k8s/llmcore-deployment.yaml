@@ -47,8 +47,6 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: CORE_GRPC_ADDR
-        - name: DB_DSN
-          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
         - name: DB_HOST
           valueFrom:
             configMapKeyRef:
@@ -74,6 +72,9 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: DB_NAME
+        # DB_DSN ПОСЛЕ компонентов — K8s $(VAR) interpolation требует порядка
+        - name: DB_DSN
+          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:

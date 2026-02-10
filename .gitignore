@@ -8,3 +8,6 @@ mcp/node_modules/
 mcp/dist/
 artifacts/catalog/*.json
 !artifacts/catalog/.gitkeep
+
+# K8s secrets
+**/k8s/secret.yaml

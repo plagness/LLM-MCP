@@ -30,8 +30,6 @@ spec:
         image: llm-mcp-llmtelemetry:latest
         imagePullPolicy: IfNotPresent
         env:
-        - name: DB_DSN
-          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
         - name: DB_HOST
           valueFrom:
             configMapKeyRef:
@@ -57,13 +55,16 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: DB_NAME
+        # DB_DSN ПОСЛЕ компонентов — K8s $(VAR) interpolation требует порядка
+        - name: DB_DSN
+          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
         - name: TELEGRAM_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: llm-secrets
               key: TELEGRAM_BOT_TOKEN
         - name: TELEGRAM_CHAT_ID
-          value: ""  # Укажите ID чата для уведомлений
+          value: "-1001455291970"
         - name: TELEGRAM_UPDATE_INTERVAL
           valueFrom:
             configMapKeyRef:

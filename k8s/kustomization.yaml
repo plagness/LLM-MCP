@@ -23,14 +23,10 @@ resources:
   # - ollama-service.yaml
 
 # Общие метки для всех ресурсов
-commonLabels:
-  project: neuronswarm
-  module: llm-mcp
-
-# Общие аннотации
-commonAnnotations:
-  maintainer: "plag"
-  description: "LLM MCP module for NeuronSwarm"
+labels:
+  - pairs:
+      project: neuronswarm
+      module: llm-mcp
 
 # Генераторы ConfigMap и Secret
 # (уже определены явно в файлах выше)

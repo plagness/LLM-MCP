@@ -28,5 +28,10 @@ data:
   # Маршрутизация через telegram-mcp (многоботовая архитектура)
   TELEGRAM_USE_MCP: "1"
 
+  # Автообнаружение Ollama на Tailscale mesh (каждые 5 мин)
+  DISCOVERY_INTERVAL: "300"
+  # Мультипорт Ollama: 11434 (chat) + 11435 (embed) на каждом устройстве
+  OLLAMA_PORTS: "11434,11435"
+
   # Logging
   LOG_LEVEL: "info"

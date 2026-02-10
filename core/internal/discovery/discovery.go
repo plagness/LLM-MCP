@@ -241,17 +241,18 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 // ensurePortDevice создаёт запись устройства для не-default порта,
 // копируя базовые поля из родительского устройства
 func (r *Runner) ensurePortDevice(ctx context.Context, portDeviceID, baseDeviceID string, port int) error {
+	portStr := strconv.Itoa(port)
 	_, err := r.DB.Exec(ctx, `
 		INSERT INTO devices (id, name, platform, arch, host, tags, status, last_seen, updated_at)
-		SELECT $1, name || ':' || $3::text, platform, arch, host,
-		       jsonb_build_object('port_device', true, 'base_device', $2, 'ollama_port', $3),
+		SELECT $1::text, name || ':' || $3::text, platform, arch, host,
+		       jsonb_build_object('port_device', true, 'base_device', $2::text, 'ollama_port', $3::text),
 		       status, last_seen, now()
-		FROM devices WHERE id = $2
+		FROM devices WHERE id = $2::text
 		ON CONFLICT (id) DO UPDATE SET
 		  status = EXCLUDED.status,
 		  last_seen = EXCLUDED.last_seen,
 		  updated_at = now()
-	`, portDeviceID, baseDeviceID, port)
+	`, portDeviceID, baseDeviceID, portStr)
 	return err
 }
 

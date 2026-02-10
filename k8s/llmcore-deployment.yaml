@@ -90,6 +90,23 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: LOG_LEVEL
+        # Автообнаружение Ollama на Tailscale mesh
+        - name: DISCOVERY_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DISCOVERY_INTERVAL
+        # Мультипорт Ollama: 11434 (chat) + 11435 (embed)
+        - name: OLLAMA_PORTS
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: OLLAMA_PORTS
+        - name: OLLAMA_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: OLLAMA_BASE_URL
         volumeMounts:
         # Tailscale binary для сетевого взаимодействия
         - name: tailscale-bin

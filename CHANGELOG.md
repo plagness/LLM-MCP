@@ -1,5 +1,41 @@
 # Changelog
 
+## [2026.02.8] - 2026-02-10
+
+### Multi-Ollama Discovery
+- **OLLAMA_PORTS** env var: discovery пробирует несколько портов на каждом устройстве (default: 11434).
+- `probeOllamaPort()` — probe конкретного порта, `ensurePortDevice()` — создание device entry для non-default портов.
+- `ollama_addr` хранит полный `ip:port` формат для всех портов.
+- Subnet scan с multi-port поддержкой.
+
+### Worker addr:port
+- `_split_host_port()` — корректное разделение addr на host и port (IPv4/IPv6).
+- `_resolve_ollama_base()` — автоматическое определение порта из `ollama_addr`.
+- Backward compat: addr без порта → default 11434.
+
+### Compose Ollama profiles
+- Profile `ollama` — одиночный инстанс (:11434).
+- Profile `ollama-multi` — 3 инстанса (:11434, :11435, :11436).
+- Изолированные named volumes для каждого инстанса.
+- `OLLAMA_PORTS` env передаётся в llmcore.
+
+### Kubernetes манифесты
+- Полный набор K8s манифестов: namespace, secret, configmap, PVC, StatefulSet, Deployments, Services.
+- `ollama-deployment.yaml` — Deployment с nodeSelector, health probes, resource limits.
+- `ollama-service.yaml` — NodePort 31434.
+- `kustomization.yaml` с общими метками и аннотациями.
+- `k8s/README.md` — документация развёртывания.
+
+### Документация и инструменты
+- `TODO.md` — план multi-Ollama + distributed compute.
+- `CHANGELOG_V2.md`, `INTEGRATION_GUIDE_V2.md`, `V2_RELEASE_SUMMARY.md` — полная документация v2.
+- `scripts/sync_openrouter_models.py`, `scripts/probe_openrouter_models.py` — инструменты синхронизации моделей.
+- `config/curated_openrouter_models.yaml` — курированный список моделей.
+
+### Прочее
+- Санитизация PII из всех документов и примеров.
+- Синхронизация версий: VERSION, README badge, .env.example, mcp/package.json.
+
 ## [2026.02.7] - 2026-02-09
 
 ### Tier 1 — Новые эндпоинты и запись расходов

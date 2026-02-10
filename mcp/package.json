@@ -1,6 +1,6 @@
 {
   "name": "llm-mcp-adapter",
-  "version": "2026.02.1",
+  "version": "2026.02.8",
   "private": true,
   "type": "module",
   "scripts": {

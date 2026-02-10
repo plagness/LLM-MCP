@@ -1,6 +1,6 @@
 # LLM-MCP
 
-[![Version](https://img.shields.io/badge/version-2026.02.6-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-2026.02.8-blue.svg)](VERSION)
 [![Runtime](https://img.shields.io/badge/runtime-go%20%2B%20python%20%2B%20node-green.svg)](compose.yml)
 [![Queue](https://img.shields.io/badge/queue-postgres-orange.svg)](db/init)
 [![Transport](https://img.shields.io/badge/transport-http%20%2B%20grpc-7a3cff.svg)](proto/llm.proto)
@@ -19,6 +19,11 @@
 - Облачные провайдеры: OpenAI, OpenRouter.
 - Единый job lifecycle: submit -> claim -> heartbeat -> complete/fail.
 
+### 🔍 Multi-Ollama Discovery
+- Автодискавери устройств через Tailscale mesh.
+- Multi-port probe (`OLLAMA_PORTS`) — несколько Ollama инстансов на одном хосте.
+- Compose profiles: `ollama` (single), `ollama-multi` (3 инстанса).
+
 ### 🗂️ Устойчивая очередь
 - Postgres-очередь с `FOR UPDATE SKIP LOCKED`.
 - Lease-механика: задачи возвращаются в очередь после таймаута воркера.
@@ -28,6 +33,11 @@
 - `llmmcp` отдаёт MCP/HTTP bridge к core.
 - `llmtelemetry` публикует статус/прогресс в Telegram.
 - Поддержан route через `telegram-mcp` и direct fallback.
+
+### ☸️ Kubernetes
+- Полный набор K8s манифестов с Kustomize.
+- Ollama Deployment с nodeSelector для привязки к нодам.
+- Готов к развёртыванию на K3s кластере.
 
 ## 🧱 Архитектура
 
@@ -104,12 +114,16 @@ curl -fsS http://127.0.0.1:3333/health || true
 
 ```text
 llm-mcp/
-├── core/           # Go API/router/queue
+├── core/           # Go API/router/queue/discovery
 ├── worker/         # Python execution adapters
 ├── telemetry/      # Telegram telemetry sender
 ├── mcp/            # MCP adapter (Node.js)
-├── db/init/        # SQL init
+├── planner/        # Фоновые процессы (sync, cleanup, benchmarks)
+├── db/init/        # SQL init + миграции
+├── k8s/            # Kubernetes манифесты
 ├── proto/          # gRPC contracts
+├── scripts/        # Утилиты (sync моделей, probe)
+├── config/         # Курированные конфиги
 └── compose.yml
 ```
 

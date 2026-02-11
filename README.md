@@ -1,6 +1,6 @@
 # LLM-MCP
 
-[![Version](https://img.shields.io/badge/version-2026.02.8-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-2026.02.11-blue.svg)](VERSION)
 [![Runtime](https://img.shields.io/badge/runtime-go%20%2B%20python%20%2B%20node-green.svg)](compose.yml)
 [![Queue](https://img.shields.io/badge/queue-postgres-orange.svg)](db/init)
 [![Transport](https://img.shields.io/badge/transport-http%20%2B%20grpc-7a3cff.svg)](proto/llm.proto)

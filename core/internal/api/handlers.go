@@ -955,10 +955,12 @@ func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	devices := []models.DeviceInfo{}
 	rows4, err := s.DB.Query(ctx, `
-		SELECT d.id, d.name, d.status,
+		SELECT d.id, d.name, d.status, d.platform, d.arch, d.host,
 		       (SELECT COUNT(*) FROM device_models dm WHERE dm.device_id = d.id AND dm.available = TRUE) AS models,
+		       (SELECT COALESCE(json_agg(dm.model_id), '[]'::json) FROM device_models dm WHERE dm.device_id = d.id AND dm.available = TRUE) AS model_names,
 		       (SELECT COUNT(*) FROM jobs j WHERE j.status='running' AND j.payload->>'device_id' = d.id) AS load,
-		       (d.tags->>'ollama_latency_ms')::int AS latency
+		       (d.tags->>'ollama_latency_ms')::int AS latency,
+		       d.last_seen
 		FROM devices d
 		WHERE COALESCE(d.tags->>'ollama', 'false') = 'true'
 		ORDER BY d.status DESC, d.name ASC LIMIT 20
@@ -967,7 +969,7 @@ func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 		defer rows4.Close()
 		for rows4.Next() {
 			var di models.DeviceInfo
-			if rows4.Scan(&di.ID, &di.Name, &di.Status, &di.Models, &di.Load, &di.Latency) == nil {
+			if rows4.Scan(&di.ID, &di.Name, &di.Status, &di.Platform, &di.Arch, &di.Host, &di.Models, &di.ModelNames, &di.Load, &di.Latency, &di.LastSeen) == nil {
 				devices = append(devices, di)
 			}
 		}

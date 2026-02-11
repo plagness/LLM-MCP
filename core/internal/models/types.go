@@ -167,12 +167,17 @@ type RunningJob struct {
 
 // DeviceInfo — информация об устройстве для dashboard
 type DeviceInfo struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Models  int    `json:"models_count"`
-	Load    int    `json:"running_jobs"`
-	Latency *int   `json:"latency_ms"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	Platform   string          `json:"platform"`
+	Arch       string          `json:"arch"`
+	Host       string          `json:"host"`
+	Models     int             `json:"models_count"`
+	ModelNames json.RawMessage `json:"model_names"`
+	Load       int             `json:"running_jobs"`
+	Latency    *int            `json:"latency_ms"`
+	LastSeen   *time.Time      `json:"last_seen"`
 }
 
 // ProviderCost — расходы по провайдеру

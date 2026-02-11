@@ -64,7 +64,7 @@ spec:
               name: llm-secrets
               key: TELEGRAM_BOT_TOKEN
         - name: TELEGRAM_CHAT_ID
-          value: "-1001455291970"
+          value: "-1001234567890"
         - name: TELEGRAM_UPDATE_INTERVAL
           valueFrom:
             configMapKeyRef:

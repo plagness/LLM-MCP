@@ -25,9 +25,9 @@ resources:
 # Общие метки для всех ресурсов
 labels:
   - pairs:
-      app.kubernetes.io/part-of: neuronswarm
+      app.kubernetes.io/part-of: llm-mcp
       app.kubernetes.io/managed-by: kustomize
-      project: neuronswarm
+      project: llm-mcp
       module: llm-mcp
 
 # Генераторы ConfigMap и Secret

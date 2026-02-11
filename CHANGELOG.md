@@ -1,5 +1,26 @@
 # Changelog
 
+## [2026.02.11] - 2026-02-10
+
+### Dashboard API (расширение для Mini App)
+
+- **DeviceInfo**: добавлены поля `platform`, `arch`, `host`, `model_names`, `last_seen` в `/v1/dashboard`
+- Расширен SQL-запрос devices: JSON-массив доступных моделей, метаданные устройства
+- Обратная совместимость: llm.html игнорирует новые поля
+
+### Прочее
+- VERSION: `2026.02.10` → `2026.02.11`
+
+---
+
+## [2026.02.9] - 2026-02-10
+
+### Multi-port Discovery
+- `feat(discovery): multi-port Ollama + fix pgx type inference`
+- Корректный multi-port probe с explicit `::text` cast для pgx v5
+
+---
+
 ## [2026.02.8] - 2026-02-10
 
 ### Multi-Ollama Discovery

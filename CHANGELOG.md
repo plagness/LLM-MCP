@@ -1,5 +1,50 @@
 # Changelog
 
+## [2026.02.12] - 2026-02-14
+
+### Smart Routing
+- Контекстно-зависимый маппинг quality→tiers (3 бакета контекста: ≤4K, 4K-32K, >32K)
+- Каскадный fallback: local ollama → openrouter → openai
+- Поддержка thinking-моделей (qwen3, deepseek-r1, phi4-reasoning, exaone-deep, lfm2.5-thinking, deepscaler)
+- Балансировка нагрузки: учёт queued+running задач при batch-отправке
+
+### Dashboard Host→Node Hierarchy
+- Иерархическая структура: Host → Node (физическая машина → Ollama-инстансы на портах)
+- Автоопределение orchestration типа (docker/native)
+- Подсчёт уникальных моделей (не дубликатов по устройствам)
+- Issues на человеческом языке (offline хосты, low success rate, stuck queue)
+
+### Developer Tools — 4 новых endpoint'а
+- `GET /v1/debug/health` — глубокая диагностика (БД, очередь, хосты, workers)
+- `GET /v1/debug/actions` — каталог API с curl-примерами
+- `GET /v1/debug/capacity` — мощности кластера (слоты, утилизация)
+- `POST /v1/debug/test` — smoke test pipeline
+
+### Discovery
+- Автоопределение tier, thinking, context_k для Ollama-моделей
+
+### Worker
+- Поддержка thinking-ответов (`<think>` tag parsing)
+- Cost-расчёт из `_price_in_1m`/`_price_out_1m`
+
+### Исправления
+- UUID-валидация в HandleJobByID (500→404)
+- Graceful HandleCostsSummary при отсутствии llm_costs
+- Очистка документации от реальных хостнеймов и IP
+
+### Миграции
+- `04_smart_routing.sql` — таблицы `model_pricing`, `llm_costs`, view `v_device_stats`
+
+### Новые env-переменные
+- `OLLAMA_PORTS` — мультипортовое discovery (default: `11434`)
+- `DEVICE_MAX_CONCURRENCY` — макс задач на устройство (default: `1`)
+
+### Прочее
+- VERSION: `2026.02.11` → `2026.02.12`
+- Roadmap: P2P model distribution, auto-scaling моделей
+
+---
+
 ## [2026.02.11] - 2026-02-10
 
 ### Dashboard API (расширение для Mini App)

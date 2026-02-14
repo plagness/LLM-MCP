@@ -185,7 +185,7 @@ curl -N http://127.0.0.1:8080/v1/jobs/{id}/stream
 ```json
 {
   "status": "warning",
-  "version": "2026.02.14",
+  "version": "2026.02.12",
   "checks": {
     "database": {"status": "ok", "latency_ms": 3, "connections": {"active": 2, "max": 10}},
     "queue":    {"status": "ok", "queued": 2, "running": 1, "stuck": 0},

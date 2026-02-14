@@ -9,5 +9,9 @@ mcp/dist/
 artifacts/catalog/*.json
 !artifacts/catalog/.gitkeep
 
+# Build artifacts
+artifacts/llmcore
+core/llmcore
+
 # K8s secrets
 **/k8s/secret.yaml

@@ -4,7 +4,9 @@ metadata:
   name: llmworker
   namespace: ns-llm
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: llmworker
@@ -45,6 +47,16 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: OLLAMA_BASE_URL
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: OPENAI_API_KEY
+        - name: OPENROUTER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: OPENROUTER_API_KEY
         - name: LOG_LEVEL
           valueFrom:
             configMapKeyRef:
@@ -52,11 +64,11 @@ spec:
               key: LOG_LEVEL
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "256Mi"
+            cpu: "100m"
           limits:
-            memory: "2Gi"
-            cpu: "2000m"
+            memory: "1Gi"
+            cpu: "1000m"
       # Альтернатива hostNetwork: hostAliases для маппинга Ollama
       # hostAliases:
       # - ip: "192.168.1.100"  # IP хост-машины

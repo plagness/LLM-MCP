@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"llm-mcp/core/internal/models"
 	"llm-mcp/core/internal/routing"
 )
+
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	log.Printf("http %s %s", r.Method, r.URL.Path)
@@ -103,6 +106,10 @@ func (s *Server) HandleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := path
+	if !uuidRe.MatchString(jobID) {
+		WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	jobRow, err := s.fetchJob(ctx, jobID)
@@ -326,6 +333,11 @@ func (s *Server) HandleWorkerComplete(w http.ResponseWriter, r *http.Request) {
 	// Запись стоимости в llm_costs
 	s.RecordCost(ctx, req.JobID, req.Metrics)
 
+	// Circuit breaker: reset для устройства при успехе
+	if deviceID := extractDeviceID(req.Result); deviceID != "" {
+		s.Router.RecordDeviceResult(deviceID, true)
+	}
+
 	log.Printf("job complete id=%s worker=%s", req.JobID, req.WorkerID)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -385,6 +397,11 @@ func (s *Server) HandleWorkerFail(w http.ResponseWriter, r *http.Request) {
 		  ORDER BY started_at DESC LIMIT 1
 		)
 	`, req.Error, req.Metrics, req.JobID)
+	// Circuit breaker: инкремент ошибок для устройства
+	if deviceID := extractDeviceIDFromJob(ctx, s, req.JobID); deviceID != "" {
+		s.Router.RecordDeviceResult(deviceID, false)
+	}
+
 	log.Printf("job failed id=%s worker=%s status=%s error=%s", req.JobID, req.WorkerID, status, req.Error)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -461,6 +478,10 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID s
 	log.Printf("http %s %s", r.Method, r.URL.Path)
 	if r.Method != http.MethodGet {
 		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	if !uuidRe.MatchString(jobID) {
+		WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -611,6 +632,12 @@ func (s *Server) HandleDiscoveryLast(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, resp)
 }
 
+// qualityTimeouts — таймаут в секундах по quality level
+var qualityTimeouts = map[string]int{
+	"turbo": 15, "economy": 30, "standard": 60,
+	"premium": 90, "ultra": 120, "max": 180,
+}
+
 func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("http %s %s", r.Method, r.URL.Path)
 	if r.Method != http.MethodPost {
@@ -642,6 +669,14 @@ func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		deadline = &t
 	}
+	// Авто-deadline по quality
+	if deadline == nil {
+		quality := strings.ToLower(strings.TrimSpace(req.Quality))
+		if secs, ok := qualityTimeouts[quality]; ok {
+			t := time.Now().UTC().Add(time.Duration(secs) * time.Second)
+			deadline = &t
+		}
+	}
 
 	row := s.DB.QueryRow(ctx, `
 		INSERT INTO jobs (kind, payload, priority, source, max_attempts, deadline_at)
@@ -654,7 +689,7 @@ func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_insert_failed"})
 		return
 	}
-	log.Printf("llm route provider=%s kind=%s job=%s", provider, kind, jobID)
+	log.Printf("llm route provider=%s kind=%s job=%s quality=%s", provider, kind, jobID, req.Quality)
 	WriteJSON(w, http.StatusAccepted, models.LLMResponse{JobID: jobID, Provider: provider, Kind: kind})
 }
 
@@ -857,35 +892,44 @@ func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	// Проверяем существование таблицы llm_costs (может быть ещё не создана)
+	var tableExists bool
+	_ = s.DB.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='llm_costs')
+	`).Scan(&tableExists)
+
 	var totalCost float64
 	var totalJobs int
-	err := s.DB.QueryRow(ctx, `
-		SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM llm_costs WHERE created_at >= now() - $1::interval
-	`, interval).Scan(&totalCost, &totalJobs)
-	if err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
-		return
-	}
-
-	rows, err := s.DB.Query(ctx, `
-		SELECT provider, COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS jobs,
-		       COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out
-		FROM llm_costs WHERE created_at >= now() - $1::interval
-		GROUP BY provider ORDER BY cost DESC
-	`, interval)
-	if err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
-		return
-	}
-	defer rows.Close()
-
 	byProvider := []models.ProviderCost{}
-	for rows.Next() {
-		var pc models.ProviderCost
-		if err := rows.Scan(&pc.Provider, &pc.Cost, &pc.Jobs, &pc.TokensIn, &pc.TokensOut); err != nil {
-			continue
+
+	if tableExists {
+		err := s.DB.QueryRow(ctx, `
+			SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM llm_costs WHERE created_at >= now() - $1::interval
+		`, interval).Scan(&totalCost, &totalJobs)
+		if err != nil {
+			WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+			return
 		}
-		byProvider = append(byProvider, pc)
+
+		rows, err := s.DB.Query(ctx, `
+			SELECT provider, COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS jobs,
+			       COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out
+			FROM llm_costs WHERE created_at >= now() - $1::interval
+			GROUP BY provider ORDER BY cost DESC
+		`, interval)
+		if err != nil {
+			WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var pc models.ProviderCost
+			if err := rows.Scan(&pc.Provider, &pc.Cost, &pc.Jobs, &pc.TokensIn, &pc.TokensOut); err != nil {
+				continue
+			}
+			byProvider = append(byProvider, pc)
+		}
 	}
 
 	WriteJSON(w, http.StatusOK, map[string]any{
@@ -960,20 +1004,30 @@ func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 		       (SELECT COALESCE(json_agg(dm.model_id), '[]'::json) FROM device_models dm WHERE dm.device_id = d.id AND dm.available = TRUE) AS model_names,
 		       (SELECT COUNT(*) FROM jobs j WHERE j.status='running' AND j.payload->>'device_id' = d.id) AS load,
 		       (d.tags->>'ollama_latency_ms')::int AS latency,
-		       d.last_seen
+		       d.last_seen,
+		       d.tags
 		FROM devices d
 		WHERE COALESCE(d.tags->>'ollama', 'false') = 'true'
-		ORDER BY d.status DESC, d.name ASC LIMIT 20
+		  AND d.id NOT LIKE 'worker-%'
+		ORDER BY d.status DESC, d.name ASC LIMIT 50
 	`)
 	if err == nil {
 		defer rows4.Close()
 		for rows4.Next() {
 			var di models.DeviceInfo
-			if rows4.Scan(&di.ID, &di.Name, &di.Status, &di.Platform, &di.Arch, &di.Host, &di.Models, &di.ModelNames, &di.Load, &di.Latency, &di.LastSeen) == nil {
+			if rows4.Scan(&di.ID, &di.Name, &di.Status, &di.Platform, &di.Arch, &di.Host, &di.Models, &di.ModelNames, &di.Load, &di.Latency, &di.LastSeen, &di.Tags) == nil {
 				devices = append(devices, di)
 			}
 		}
 	}
+
+	// Подсчёт online workers
+	var workersOnline int
+	_ = s.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM devices
+		WHERE id LIKE 'worker-%' AND status = 'online'
+		  AND last_seen > now() - interval '10 minutes'
+	`).Scan(&workersOnline)
 
 	var costDay, costWeek, costMonth float64
 	_ = s.DB.QueryRow(ctx, `SELECT COALESCE(SUM(cost_usd), 0) FROM llm_costs WHERE created_at >= now() - interval '1 day'`).Scan(&costDay)
@@ -981,13 +1035,48 @@ func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 	_ = s.DB.QueryRow(ctx, `SELECT COALESCE(SUM(cost_usd), 0) FROM llm_costs WHERE created_at >= now() - interval '30 days'`).Scan(&costMonth)
 
 	var modelsCount int
-	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM models`).Scan(&modelsCount)
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(DISTINCT model_id) FROM device_models WHERE available = TRUE`).Scan(&modelsCount)
+
+	// Загружаем device stats из v_device_stats view
+	deviceStatsMap := map[string]*models.DeviceStats{}
+	rows5, err := s.DB.Query(ctx, `
+		SELECT device_id, total_jobs_7d, done_jobs_7d, success_rate, avg_latency_ms
+		FROM v_device_stats
+	`)
+	if err == nil {
+		defer rows5.Close()
+		for rows5.Next() {
+			var deviceID string
+			var ds models.DeviceStats
+			if rows5.Scan(&deviceID, &ds.TotalJobs7d, &ds.DoneJobs7d, &ds.SuccessRate, &ds.AvgLatencyMs) == nil {
+				deviceStatsMap[deviceID] = &ds
+			}
+		}
+	}
+
+	// Добавляем stats и circuit status к каждому устройству
+	for i := range devices {
+		if st, ok := deviceStatsMap[devices[i].ID]; ok {
+			devices[i].Stats = st
+		}
+		devices[i].Circuit = s.Router.GetCircuitStatus(devices[i].ID)
+	}
+
+	// Строим иерархию Host→Node
+	maxConc := config.GetenvInt("DEVICE_MAX_CONCURRENCY", 1)
+	hosts := buildHostHierarchy(devices, deviceStatsMap, s.Router, maxConc)
+
+	// Генерируем issues для dashboard
+	issues := buildDashboardIssues(hosts, jobStats, workersOnline)
 
 	WriteJSON(w, http.StatusOK, map[string]any{
-		"jobs":         jobStats,
-		"benchmarks":   benchStats,
-		"running_jobs": runningJobs,
-		"devices":      devices,
+		"jobs":           jobStats,
+		"benchmarks":     benchStats,
+		"running_jobs":   runningJobs,
+		"devices":        devices,
+		"hosts":          hosts,
+		"workers_online": workersOnline,
+		"issues":         issues,
 		"costs": map[string]float64{
 			"today": costDay,
 			"week":  costWeek,
@@ -995,5 +1084,725 @@ func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 		},
 		"models_count": modelsCount,
 		"updated_at":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// buildHostHierarchy группирует плоский список devices в иерархию Host→Node
+func buildHostHierarchy(devices []models.DeviceInfo, statsMap map[string]*models.DeviceStats, router *routing.Router, maxConc int) []models.HostInfo {
+	type parsedTags struct {
+		PortDevice bool   `json:"port_device"`
+		BaseDevice string `json:"base_device"`
+		OllamaPort int    `json:"ollama_port"`
+	}
+
+	// Парсим tags и разделяем на base hosts и port devices
+	hostMap := map[string]*models.HostInfo{}
+	portDevices := []struct {
+		device models.DeviceInfo
+		tags   parsedTags
+	}{}
+
+	for _, d := range devices {
+		var t parsedTags
+		if len(d.Tags) > 0 {
+			_ = json.Unmarshal(d.Tags, &t)
+		}
+
+		if t.PortDevice && t.BaseDevice != "" {
+			portDevices = append(portDevices, struct {
+				device models.DeviceInfo
+				tags   parsedTags
+			}{d, t})
+			continue
+		}
+
+		// Это base host
+		hostMap[d.ID] = &models.HostInfo{
+			ID:       d.ID,
+			Name:     d.Name,
+			Platform: d.Platform,
+			Status:   d.Status,
+			LastSeen: d.LastSeen,
+			Circuit:  "ok",
+		}
+	}
+
+	// Привязываем port devices к base hosts
+	for _, pd := range portDevices {
+		host, ok := hostMap[pd.tags.BaseDevice]
+		if !ok {
+			// Base host не найден — создаём из port device
+			host = &models.HostInfo{
+				ID:            pd.tags.BaseDevice,
+				Name:          pd.tags.BaseDevice,
+				Platform:      pd.device.Platform,
+				Status:        pd.device.Status,
+				LastSeen:      pd.device.LastSeen,
+				Orchestration: "docker",
+				Circuit:       "ok",
+			}
+			hostMap[pd.tags.BaseDevice] = host
+		}
+		host.Orchestration = "docker"
+
+		port := pd.tags.OllamaPort
+		if port == 0 {
+			port = 11434
+		}
+		node := models.NodeInfo{
+			Port:       port,
+			DeviceID:   pd.device.ID,
+			Role:       inferNodeRole(pd.device.ModelNames),
+			Models:     pd.device.Models,
+			ModelNames: pd.device.ModelNames,
+			Latency:    pd.device.Latency,
+			Running:    pd.device.Load,
+			Stats:      pd.device.Stats,
+			Circuit:    pd.device.Circuit,
+		}
+		host.Nodes = append(host.Nodes, node)
+		host.TotalModels += pd.device.Models
+		host.TotalRunning += pd.device.Load
+	}
+
+	// Добавляем base host как ноду :11434 (он сам содержит модели на дефолтном порту)
+	for _, host := range hostMap {
+		for _, d := range devices {
+			if d.ID == host.ID && d.Models > 0 {
+				node := models.NodeInfo{
+					Port:       11434,
+					DeviceID:   d.ID,
+					Role:       inferNodeRole(d.ModelNames),
+					Models:     d.Models,
+					ModelNames: d.ModelNames,
+					Latency:    d.Latency,
+					Running:    d.Load,
+					Stats:      d.Stats,
+					Circuit:    d.Circuit,
+				}
+				host.Nodes = append(host.Nodes, node)
+				host.TotalModels += d.Models
+				host.TotalRunning += d.Load
+				break
+			}
+		}
+		// Если нет port devices — native, иначе уже docker
+		if host.Orchestration == "" {
+			host.Orchestration = "native"
+		}
+	}
+
+	// Агрегация circuit и slots
+	for _, host := range hostMap {
+		host.TotalSlots = len(host.Nodes) * maxConc
+
+		worst := "ok"
+		for _, n := range host.Nodes {
+			if n.Circuit == "degraded" || (n.Circuit == "probe" && worst == "ok") {
+				worst = n.Circuit
+			}
+		}
+		host.Circuit = worst
+
+		// Агрегация stats
+		var totalJobs, doneJobs, latencySum, latencyCount int
+		for _, n := range host.Nodes {
+			if n.Stats != nil {
+				totalJobs += n.Stats.TotalJobs7d
+				doneJobs += n.Stats.DoneJobs7d
+				if n.Stats.AvgLatencyMs > 0 {
+					latencySum += n.Stats.AvgLatencyMs * n.Stats.TotalJobs7d
+					latencyCount += n.Stats.TotalJobs7d
+				}
+			}
+		}
+		if totalJobs > 0 {
+			sr := float64(0)
+			if totalJobs > 0 {
+				sr = float64(doneJobs) * 100.0 / float64(totalJobs)
+			}
+			avgLat := 0
+			if latencyCount > 0 {
+				avgLat = latencySum / latencyCount
+			}
+			host.Stats = &models.DeviceStats{
+				TotalJobs7d:  totalJobs,
+				DoneJobs7d:   doneJobs,
+				SuccessRate:  sr,
+				AvgLatencyMs: avgLat,
+			}
+		}
+	}
+
+	// Сортировка: online first, потом по имени
+	result := make([]models.HostInfo, 0, len(hostMap))
+	for _, h := range hostMap {
+		result = append(result, *h)
+	}
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			// online < offline, потом по имени
+			si := 0
+			if result[i].Status == "online" {
+				si = 1
+			}
+			sj := 0
+			if result[j].Status == "online" {
+				sj = 1
+			}
+			if sj > si || (si == sj && result[j].Name < result[i].Name) {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+
+	return result
+}
+
+// inferNodeRole определяет роль ноды (chat/embed/mixed) по именам моделей
+func inferNodeRole(modelNames json.RawMessage) string {
+	var names []string
+	if len(modelNames) > 0 {
+		_ = json.Unmarshal(modelNames, &names)
+	}
+	if len(names) == 0 {
+		return "chat"
+	}
+	hasEmbed := false
+	hasChat := false
+	for _, n := range names {
+		nl := strings.ToLower(n)
+		if strings.Contains(nl, "embed") {
+			hasEmbed = true
+		} else {
+			hasChat = true
+		}
+	}
+	if hasEmbed && hasChat {
+		return "mixed"
+	}
+	if hasEmbed {
+		return "embed"
+	}
+	return "chat"
+}
+
+// buildDashboardIssues генерирует список проблем на человеческом языке
+func buildDashboardIssues(hosts []models.HostInfo, jobStats map[string]int, workersOnline int) []string {
+	var issues []string
+
+	// Offline hosts
+	for _, h := range hosts {
+		if h.Status != "online" && h.LastSeen != nil {
+			ago := time.Since(*h.LastSeen)
+			var agoStr string
+			if ago < time.Hour {
+				agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
+			} else {
+				agoStr = fmt.Sprintf("%dh ago", int(ago.Hours()))
+			}
+			issues = append(issues, fmt.Sprintf("Host '%s' offline (last seen %s)", h.Name, agoStr))
+		}
+	}
+
+	// Circuit breakers
+	for _, h := range hosts {
+		if h.Circuit == "degraded" {
+			issues = append(issues, fmt.Sprintf("Host '%s' circuit degraded", h.Name))
+		}
+	}
+
+	// Low success rate
+	for _, h := range hosts {
+		if h.Stats != nil && h.Stats.TotalJobs7d >= 5 && h.Stats.SuccessRate < 80 {
+			issues = append(issues, fmt.Sprintf("Host '%s' low success rate: %.1f%%", h.Name, h.Stats.SuccessRate))
+		}
+	}
+
+	// Stuck queue
+	queued := jobStats["queued"]
+	running := jobStats["running"]
+	if queued > 0 && running == 0 && workersOnline > 0 {
+		issues = append(issues, fmt.Sprintf("Queue stuck: %d jobs queued but no workers processing", queued))
+	}
+
+	// Large backlog
+	if queued > 10 {
+		issues = append(issues, fmt.Sprintf("Queue backlog: %d jobs waiting", queued))
+	}
+
+	return issues
+}
+
+// extractDeviceID извлекает device_id из result JSON
+func extractDeviceID(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	id, _ := m["device_id"].(string)
+	return strings.TrimSpace(id)
+}
+
+// extractDeviceIDFromJob извлекает device_id из payload задачи
+func extractDeviceIDFromJob(ctx context.Context, s *Server, jobID string) string {
+	var payload json.RawMessage
+	err := s.DB.QueryRow(ctx, `SELECT payload FROM jobs WHERE id = $1`, jobID).Scan(&payload)
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return ""
+	}
+	id, _ := m["device_id"].(string)
+	return strings.TrimSpace(id)
+}
+
+// ═══ Debug Endpoints ═══
+
+// HandleDebugHealth — глубокая диагностика всех компонентов
+func (s *Server) HandleDebugHealth(w http.ResponseWriter, r *http.Request) {
+	log.Printf("http %s %s", r.Method, r.URL.Path)
+	if r.Method != http.MethodGet {
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	overallStatus := "ok"
+	setWorst := func(s string) {
+		if s == "error" || (s == "warning" && overallStatus != "error") {
+			overallStatus = s
+		}
+	}
+
+	// 1. Database check
+	dbCheck := map[string]any{"status": "ok"}
+	dbStart := time.Now()
+	var one int
+	if err := s.DB.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		dbCheck["status"] = "error"
+		dbCheck["error"] = err.Error()
+		setWorst("error")
+	} else {
+		dbCheck["latency_ms"] = time.Since(dbStart).Milliseconds()
+		stat := s.DB.Stat()
+		dbCheck["connections"] = map[string]any{
+			"active": stat.AcquiredConns(),
+			"max":    stat.MaxConns(),
+			"idle":   stat.IdleConns(),
+		}
+	}
+
+	// 2. Queue check
+	queueCheck := map[string]any{"status": "ok"}
+	var queued, queueRunning, stuck int
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE status = 'queued'`).Scan(&queued)
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE status = 'running'`).Scan(&queueRunning)
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE status = 'running' AND lease_until < now()`).Scan(&stuck)
+	queueCheck["queued"] = queued
+	queueCheck["running"] = queueRunning
+	queueCheck["stuck"] = stuck
+	var oldestSec *float64
+	var oldest sql.NullFloat64
+	_ = s.DB.QueryRow(ctx, `SELECT EXTRACT(epoch FROM (now() - MIN(queued_at))) FROM jobs WHERE status = 'queued'`).Scan(&oldest)
+	if oldest.Valid {
+		v := oldest.Float64
+		oldestSec = &v
+		queueCheck["oldest_queued_sec"] = int(v)
+	}
+	if stuck > 0 {
+		queueCheck["status"] = "warning"
+		setWorst("warning")
+	}
+
+	// 3. Hosts check
+	hostsCheck := map[string]any{"status": "ok"}
+	var totalHosts, onlineHosts, offlineHosts int
+	_ = s.DB.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'online'),
+		       COUNT(*) FILTER (WHERE status != 'online')
+		FROM devices
+		WHERE COALESCE(tags->>'ollama', 'false') = 'true'
+		  AND id NOT LIKE 'worker-%'
+		  AND COALESCE(tags->>'port_device', 'false') != 'true'
+	`).Scan(&totalHosts, &onlineHosts, &offlineHosts)
+	hostsCheck["total"] = totalHosts
+	hostsCheck["online"] = onlineHosts
+	hostsCheck["offline"] = offlineHosts
+	if offlineHosts > 0 {
+		hostsCheck["status"] = "warning"
+		setWorst("warning")
+	}
+	if onlineHosts == 0 && totalHosts > 0 {
+		hostsCheck["status"] = "error"
+		setWorst("error")
+	}
+
+	// 4. Workers check
+	workersCheck := map[string]any{"status": "ok"}
+	var workersOnline int
+	_ = s.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM devices
+		WHERE id LIKE 'worker-%' AND status = 'online'
+		  AND last_seen > now() - interval '10 minutes'
+	`).Scan(&workersOnline)
+	maxConc := config.GetenvInt("DEVICE_MAX_CONCURRENCY", 1)
+	workersCheck["online"] = workersOnline
+	workersCheck["capacity"] = workersOnline * maxConc
+	if workersOnline == 0 {
+		workersCheck["status"] = "warning"
+		setWorst("warning")
+	}
+
+	// Issues
+	var issues []string
+	// Offline hosts
+	rows, err := s.DB.Query(ctx, `
+		SELECT name, last_seen FROM devices
+		WHERE COALESCE(tags->>'ollama', 'false') = 'true'
+		  AND id NOT LIKE 'worker-%'
+		  AND COALESCE(tags->>'port_device', 'false') != 'true'
+		  AND status != 'online'
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var ls *time.Time
+			if rows.Scan(&name, &ls) == nil {
+				ago := "unknown"
+				if ls != nil {
+					d := time.Since(*ls)
+					if d < time.Hour {
+						ago = fmt.Sprintf("%dm ago", int(d.Minutes()))
+					} else {
+						ago = fmt.Sprintf("%dh ago", int(d.Hours()))
+					}
+				}
+				issues = append(issues, fmt.Sprintf("Host '%s' offline (last seen %s)", name, ago))
+			}
+		}
+	}
+	if stuck > 0 {
+		issues = append(issues, fmt.Sprintf("%d jobs with expired lease", stuck))
+	}
+	if queued > 0 && queueRunning == 0 && workersOnline > 0 {
+		issues = append(issues, fmt.Sprintf("Queue stuck: %d jobs queued but no workers processing", queued))
+	}
+	if queued > 10 {
+		issues = append(issues, fmt.Sprintf("Queue backlog: %d jobs waiting", queued))
+	}
+	_ = oldestSec // используется в queueCheck
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"status":  overallStatus,
+		"version": s.Version,
+		"checks": map[string]any{
+			"database": dbCheck,
+			"queue":    queueCheck,
+			"hosts":    hostsCheck,
+			"workers":  workersCheck,
+		},
+		"issues": issues,
+	})
+}
+
+// HandleDebugActions — каталог всех API endpoints
+func (s *Server) HandleDebugActions(w http.ResponseWriter, r *http.Request) {
+	log.Printf("http %s %s", r.Method, r.URL.Path)
+	if r.Method != http.MethodGet {
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+
+	type endpoint struct {
+		Method      string `json:"method"`
+		Path        string `json:"path"`
+		Description string `json:"description"`
+		Example     string `json:"example"`
+	}
+
+	endpoints := []endpoint{
+		{"GET", "/health", "Базовая проверка здоровья сервиса", "curl http://localhost:8080/health"},
+		{"GET", "/version", "Версия сервиса", "curl http://localhost:8080/version"},
+		{"GET", "/v1/dashboard", "Полный snapshot: jobs, hosts, costs, running jobs, issues", "curl http://localhost:8080/v1/dashboard | jq ."},
+		{"POST", "/v1/jobs", "Создать задачу в очереди", "curl -X POST http://localhost:8080/v1/jobs -d '{\"kind\":\"ollama.generate\",\"payload\":{\"model\":\"qwen3:1.7b\",\"prompt\":\"Hello\"}}'"},
+		{"GET", "/v1/jobs/{id}", "Статус задачи (payload, result, attempts)", "curl http://localhost:8080/v1/jobs/abc123"},
+		{"GET", "/v1/jobs/{id}/stream", "SSE-поток обновлений задачи в реальном времени", "curl -N http://localhost:8080/v1/jobs/abc123/stream"},
+		{"POST", "/v1/llm/request", "Smart routing: отправить LLM-запрос с автовыбором модели по quality", "curl -X POST http://localhost:8080/v1/llm/request -d '{\"task\":\"chat\",\"quality\":\"standard\",\"prompt\":\"Hello\"}'"},
+		{"POST", "/v1/workers/register", "Регистрация worker-а (обычно автоматически)", "curl -X POST http://localhost:8080/v1/workers/register -d '{\"worker\":{\"id\":\"w1\",\"name\":\"test\"}}'"},
+		{"POST", "/v1/workers/claim", "Worker забирает задачу из очереди", "curl -X POST http://localhost:8080/v1/workers/claim -d '{\"worker_id\":\"w1\",\"kinds\":[\"ollama.generate\"]}'"},
+		{"POST", "/v1/workers/complete", "Worker завершает задачу с результатом", "curl -X POST http://localhost:8080/v1/workers/complete -d '{\"worker_id\":\"w1\",\"job_id\":\"abc123\",\"result\":{}}'"},
+		{"POST", "/v1/workers/fail", "Worker помечает задачу как ошибку", "curl -X POST http://localhost:8080/v1/workers/fail -d '{\"worker_id\":\"w1\",\"job_id\":\"abc123\",\"error\":\"timeout\"}'"},
+		{"POST", "/v1/workers/heartbeat", "Worker продлевает lease задачи", "curl -X POST http://localhost:8080/v1/workers/heartbeat -d '{\"worker_id\":\"w1\",\"job_id\":\"abc123\",\"extend_seconds\":30}'"},
+		{"POST", "/v1/devices/offline", "Пометить устройство как offline", "curl -X POST http://localhost:8080/v1/devices/offline -d '{\"device_id\":\"my-host\",\"reason\":\"unreachable\"}'"},
+		{"POST", "/v1/discovery/run", "Принудительный запуск discovery всех Ollama-устройств", "curl -X POST http://localhost:8080/v1/discovery/run"},
+		{"GET", "/v1/discovery/last", "Время последнего запуска discovery", "curl http://localhost:8080/v1/discovery/last"},
+		{"POST", "/v1/benchmarks/run", "Запустить синтетический бенчмарк на модели", "curl -X POST http://localhost:8080/v1/benchmarks/run -d '{\"model\":\"qwen3:1.7b\",\"task_type\":\"generate\",\"runs\":3}'"},
+		{"GET", "/v1/benchmarks", "Последние бенчмарки (по умолчанию limit=20)", "curl 'http://localhost:8080/v1/benchmarks?limit=10'"},
+		{"GET", "/v1/costs/summary", "Сводка расходов за период по провайдерам", "curl 'http://localhost:8080/v1/costs/summary?period=week'"},
+		{"GET", "/v1/debug/health", "Глубокая диагностика: БД, очередь, устройства, workers, issues", "curl http://localhost:8080/v1/debug/health | jq .issues"},
+		{"GET", "/v1/debug/actions", "Этот эндпоинт: каталог всех API actions", "curl http://localhost:8080/v1/debug/actions | jq '.endpoints[].path'"},
+		{"GET", "/v1/debug/capacity", "Мощности кластера: слоты, загрузка, утилизация по хостам", "curl http://localhost:8080/v1/debug/capacity | jq ."},
+		{"POST", "/v1/debug/test", "Smoke test: проверяет БД, Ollama, job pipeline", "curl -X POST http://localhost:8080/v1/debug/test | jq .results"},
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"endpoints": endpoints,
+		"total":     len(endpoints),
+	})
+}
+
+// HandleDebugCapacity — мощности кластера: слоты, загрузка, утилизация
+func (s *Server) HandleDebugCapacity(w http.ResponseWriter, r *http.Request) {
+	log.Printf("http %s %s", r.Method, r.URL.Path)
+	if r.Method != http.MethodGet {
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	maxConc := config.GetenvInt("DEVICE_MAX_CONCURRENCY", 1)
+
+	// Загружаем все Ollama devices (не workers)
+	devices := []models.DeviceInfo{}
+	rows, err := s.DB.Query(ctx, `
+		SELECT d.id, d.name, d.status, d.platform, d.arch, d.host,
+		       (SELECT COUNT(*) FROM device_models dm WHERE dm.device_id = d.id AND dm.available = TRUE) AS models,
+		       (SELECT COALESCE(json_agg(dm.model_id), '[]'::json) FROM device_models dm WHERE dm.device_id = d.id AND dm.available = TRUE) AS model_names,
+		       (SELECT COUNT(*) FROM jobs j WHERE j.status='running' AND j.payload->>'device_id' = d.id) AS load,
+		       (d.tags->>'ollama_latency_ms')::int AS latency,
+		       d.last_seen,
+		       d.tags
+		FROM devices d
+		WHERE COALESCE(d.tags->>'ollama', 'false') = 'true'
+		  AND d.id NOT LIKE 'worker-%'
+		ORDER BY d.status DESC, d.name ASC LIMIT 50
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var di models.DeviceInfo
+			if rows.Scan(&di.ID, &di.Name, &di.Status, &di.Platform, &di.Arch, &di.Host, &di.Models, &di.ModelNames, &di.Load, &di.Latency, &di.LastSeen, &di.Tags) == nil {
+				devices = append(devices, di)
+			}
+		}
+	}
+
+	// Загружаем stats
+	deviceStatsMap := map[string]*models.DeviceStats{}
+	rows2, err := s.DB.Query(ctx, `SELECT device_id, total_jobs_7d, done_jobs_7d, success_rate, avg_latency_ms FROM v_device_stats`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var deviceID string
+			var ds models.DeviceStats
+			if rows2.Scan(&deviceID, &ds.TotalJobs7d, &ds.DoneJobs7d, &ds.SuccessRate, &ds.AvgLatencyMs) == nil {
+				deviceStatsMap[deviceID] = &ds
+			}
+		}
+	}
+	for i := range devices {
+		if st, ok := deviceStatsMap[devices[i].ID]; ok {
+			devices[i].Stats = st
+		}
+		devices[i].Circuit = s.Router.GetCircuitStatus(devices[i].ID)
+	}
+
+	hosts := buildHostHierarchy(devices, deviceStatsMap, s.Router, maxConc)
+
+	// Подсчёт workers
+	var workersOnline int
+	_ = s.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM devices
+		WHERE id LIKE 'worker-%' AND status = 'online'
+		  AND last_seen > now() - interval '10 minutes'
+	`).Scan(&workersOnline)
+
+	// Агрегация
+	var totalSlots, usedSlots int
+	type hostCap struct {
+		Name           string  `json:"name"`
+		Status         string  `json:"status"`
+		Slots          int     `json:"slots"`
+		Used           int     `json:"used"`
+		Free           int     `json:"free"`
+		UtilizationPct float64 `json:"utilization_pct"`
+		Models         int     `json:"models"`
+		Circuit        string  `json:"circuit"`
+	}
+	hostCaps := []hostCap{}
+	for _, h := range hosts {
+		slots := h.TotalSlots
+		used := h.TotalRunning
+		free := slots - used
+		if free < 0 {
+			free = 0
+		}
+		pct := float64(0)
+		if slots > 0 {
+			pct = float64(used) * 100.0 / float64(slots)
+		}
+		totalSlots += slots
+		usedSlots += used
+		hostCaps = append(hostCaps, hostCap{
+			Name:           h.Name,
+			Status:         h.Status,
+			Slots:          slots,
+			Used:           used,
+			Free:           free,
+			UtilizationPct: pct,
+			Models:         h.TotalModels,
+			Circuit:        h.Circuit,
+		})
+	}
+
+	freeSlots := totalSlots - usedSlots
+	if freeSlots < 0 {
+		freeSlots = 0
+	}
+	pct := float64(0)
+	if totalSlots > 0 {
+		pct = float64(usedSlots) * 100.0 / float64(totalSlots)
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"total_slots":     totalSlots,
+		"used_slots":      usedSlots,
+		"free_slots":      freeSlots,
+		"utilization_pct": pct,
+		"hosts":           hostCaps,
+		"workers": map[string]any{
+			"online":         workersOnline,
+			"total_capacity": workersOnline * maxConc,
+		},
+	})
+}
+
+// HandleDebugTest — smoke test: проверяет БД, Ollama, job pipeline
+func (s *Server) HandleDebugTest(w http.ResponseWriter, r *http.Request) {
+	log.Printf("http %s %s", r.Method, r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	overallStatus := "pass"
+	type testResult struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+		Ms     int64  `json:"ms"`
+		Detail string `json:"detail"`
+	}
+	results := []testResult{}
+	var issues []string
+
+	// 1. db_ping
+	t0 := time.Now()
+	var one int
+	if err := s.DB.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		results = append(results, testResult{"db_ping", "fail", time.Since(t0).Milliseconds(), "Error: " + err.Error()})
+		overallStatus = "fail"
+		issues = append(issues, "Database unreachable")
+	} else {
+		results = append(results, testResult{"db_ping", "pass", time.Since(t0).Milliseconds(), "PostgreSQL connected"})
+	}
+
+	// 2. db_read
+	t0 = time.Now()
+	var devCount, modelCount int
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM devices WHERE COALESCE(tags->>'ollama','false') = 'true'`).Scan(&devCount)
+	_ = s.DB.QueryRow(ctx, `SELECT COUNT(*) FROM device_models WHERE available = TRUE`).Scan(&modelCount)
+	results = append(results, testResult{"db_read", "pass", time.Since(t0).Milliseconds(), fmt.Sprintf("Read %d devices, %d models", devCount, modelCount)})
+
+	// 3. ollama_ping — ping каждого online base host
+	t0 = time.Now()
+	type ollamaHost struct {
+		ID   string
+		Name string
+		Addr string
+	}
+	var ollamaHosts []ollamaHost
+	rows, err := s.DB.Query(ctx, `
+		SELECT id, name, tags->>'ollama_addr'
+		FROM devices
+		WHERE COALESCE(tags->>'ollama', 'false') = 'true'
+		  AND id NOT LIKE 'worker-%'
+		  AND COALESCE(tags->>'port_device', 'false') != 'true'
+		  AND status = 'online'
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var h ollamaHost
+			if rows.Scan(&h.ID, &h.Name, &h.Addr) == nil && h.Addr != "" {
+				ollamaHosts = append(ollamaHosts, h)
+			}
+		}
+	}
+	reachable := 0
+	for _, h := range ollamaHosts {
+		// Quick HTTP check
+		addr := h.Addr
+		if !strings.Contains(addr, "://") {
+			addr = "http://" + addr
+		}
+		client := http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(addr + "/api/tags")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				reachable++
+			} else {
+				issues = append(issues, fmt.Sprintf("Host '%s' returned status %d", h.Name, resp.StatusCode))
+			}
+		} else {
+			issues = append(issues, fmt.Sprintf("Host '%s' unreachable (timeout 2s)", h.Name))
+		}
+	}
+	ollamaDetail := fmt.Sprintf("%d/%d hosts reachable", reachable, len(ollamaHosts))
+	ollamaStatus := "pass"
+	if reachable < len(ollamaHosts) {
+		ollamaStatus = "warn"
+		if overallStatus == "pass" {
+			overallStatus = "warn"
+		}
+	}
+	results = append(results, testResult{"ollama_ping", ollamaStatus, time.Since(t0).Milliseconds(), ollamaDetail})
+
+	// 4. job_create — создаём тестовый benchmark job и отменяем
+	t0 = time.Now()
+	var testJobID string
+	err = s.DB.QueryRow(ctx, `
+		INSERT INTO jobs (kind, payload, priority, source, max_attempts)
+		VALUES ('debug.test', '{"smoke_test": true}'::jsonb, -1, 'debug', 1)
+		RETURNING id
+	`).Scan(&testJobID)
+	if err != nil {
+		results = append(results, testResult{"job_create", "fail", time.Since(t0).Milliseconds(), "Error: " + err.Error()})
+		overallStatus = "fail"
+		issues = append(issues, "Cannot create jobs in database")
+	} else {
+		// Сразу помечаем как done чтобы не засорять очередь
+		_, _ = s.DB.Exec(ctx, `UPDATE jobs SET status = 'done', result = '{"test": true}' WHERE id = $1`, testJobID)
+		results = append(results, testResult{"job_create", "pass", time.Since(t0).Milliseconds(), fmt.Sprintf("Job %s created and cleaned", testJobID[:8])})
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"status":      overallStatus,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"results":     results,
+		"issues":      issues,
 	})
 }

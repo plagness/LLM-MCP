@@ -89,6 +89,8 @@ type LLMRequest struct {
 	Source      string              `json:"source"`
 	MaxAttempts int                 `json:"max_attempts"`
 	DeadlineAt  string              `json:"deadline_at"`
+	Quality  string `json:"quality"`  // turbo|economy|standard|premium|ultra|max
+	Thinking *bool  `json:"thinking"` // nil = auto, true = thinking блок, false = только response
 	Constraints struct {
 		PreferLocal  bool `json:"prefer_local"`
 		ForceCloud   bool `json:"force_cloud"`
@@ -178,6 +180,9 @@ type DeviceInfo struct {
 	Load       int             `json:"running_jobs"`
 	Latency    *int            `json:"latency_ms"`
 	LastSeen   *time.Time      `json:"last_seen"`
+	Tags       json.RawMessage `json:"tags,omitempty"`
+	Stats      *DeviceStats    `json:"stats,omitempty"`
+	Circuit    string          `json:"circuit,omitempty"`
 }
 
 // ProviderCost — расходы по провайдеру
@@ -187,4 +192,53 @@ type ProviderCost struct {
 	Jobs      int     `json:"jobs"`
 	TokensIn  int     `json:"tokens_in"`
 	TokensOut int     `json:"tokens_out"`
+}
+
+// ModelSelection — результат smart-роутинга
+type ModelSelection struct {
+	Model    string // ID модели
+	Provider string // ollama | openrouter | openai
+	DeviceID string // ID устройства (для ollama)
+	Addr     string // ollama_addr
+	Host     string // ollama_host
+	Tier     string // tier модели
+	Thinking bool   // модель поддерживает thinking
+	Reason   string // почему выбрана (для логов)
+}
+
+// DeviceStats — статистика устройства для dashboard
+type DeviceStats struct {
+	TotalJobs7d  int     `json:"total_jobs_7d"`
+	DoneJobs7d   int     `json:"done_jobs_7d"`
+	SuccessRate  float64 `json:"success_rate"`
+	AvgLatencyMs int     `json:"avg_latency_ms"`
+}
+
+// HostInfo — физическая машина с Ollama-нодами (иерархия Host→Node)
+type HostInfo struct {
+	ID            string       `json:"id"`
+	Name          string       `json:"name"`
+	Platform      string       `json:"platform"`
+	Status        string       `json:"status"`
+	Orchestration string       `json:"orchestration"` // docker | native
+	LastSeen      *time.Time   `json:"last_seen"`
+	Nodes         []NodeInfo   `json:"nodes"`
+	TotalModels   int          `json:"total_models"`
+	TotalRunning  int          `json:"total_running"`
+	TotalSlots    int          `json:"total_slots"`
+	Stats         *DeviceStats `json:"stats,omitempty"`
+	Circuit       string       `json:"circuit"`
+}
+
+// NodeInfo — Ollama-инстанс на конкретном порту хоста
+type NodeInfo struct {
+	Port       int             `json:"port"`
+	DeviceID   string          `json:"device_id"`
+	Role       string          `json:"role"` // chat | embed | mixed
+	Models     int             `json:"models_count"`
+	ModelNames json.RawMessage `json:"model_names"`
+	Latency    *int            `json:"latency_ms"`
+	Running    int             `json:"running_jobs"`
+	Stats      *DeviceStats    `json:"stats,omitempty"`
+	Circuit    string          `json:"circuit"`
 }

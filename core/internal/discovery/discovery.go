@@ -414,6 +414,87 @@ func buildHostHeaders(node tailNode) []string {
 	return out
 }
 
+// inferTier определяет tier модели по params_b
+func inferTier(paramsB *float64, name string) string {
+	if strings.Contains(strings.ToLower(name), "embed") {
+		return "embed"
+	}
+	if paramsB == nil {
+		return ""
+	}
+	b := *paramsB
+	switch {
+	case b <= 1.2:
+		return "tiny"
+	case b <= 2.0:
+		return "small"
+	case b <= 4.5:
+		return "medium"
+	case b <= 10.0:
+		return "large"
+	default:
+		return "xl"
+	}
+}
+
+// inferThinking определяет, поддерживает ли модель thinking
+func inferThinking(name, family string) bool {
+	n := strings.ToLower(name)
+	switch {
+	case strings.HasPrefix(n, "qwen3:"):
+		return true
+	case strings.Contains(n, "deepseek-r1"):
+		return true
+	case strings.Contains(n, "phi4-reasoning"):
+		return true
+	case strings.Contains(n, "lfm2.5-thinking"):
+		return true
+	case strings.Contains(n, "deepscaler"):
+		return true
+	case strings.Contains(n, "exaone-deep"):
+		return true
+	default:
+		return false
+	}
+}
+
+// inferContextK определяет размер контекста (тысячи токенов) по семейству модели
+func inferContextK(name, family string) int {
+	n := strings.ToLower(name)
+	switch {
+	case strings.HasPrefix(n, "tinyllama"):
+		return 2
+	case strings.HasPrefix(n, "yi:"):
+		return 4
+	case strings.HasPrefix(n, "qwen3:"), strings.HasPrefix(n, "qwen2.5:"),
+		strings.HasPrefix(n, "qwen2.5-coder:"), strings.HasPrefix(n, "exaone-deep:"),
+		strings.HasPrefix(n, "granite4:"), strings.HasPrefix(n, "lfm2.5-thinking:"),
+		strings.HasPrefix(n, "falcon3:"), strings.HasPrefix(n, "smollm2:"):
+		return 32
+	case strings.HasPrefix(n, "llama3.2:"), strings.HasPrefix(n, "phi3.5:"),
+		strings.HasPrefix(n, "phi3:"), strings.HasPrefix(n, "qwen2.5vl:"),
+		strings.HasPrefix(n, "qwen3-vl:"):
+		return 128
+	case strings.HasPrefix(n, "phi4-reasoning"):
+		return 16
+	case strings.Contains(n, "embed"):
+		return 8
+	case strings.HasPrefix(n, "gemma"):
+		return 8
+	default:
+		return 4
+	}
+}
+
+// inferKind определяет тип модели (chat/embed)
+func inferKind(name string) string {
+	n := strings.ToLower(name)
+	if strings.Contains(n, "embed") {
+		return "embed"
+	}
+	return "chat"
+}
+
 func (r *Runner) syncDeviceModels(ctx context.Context, deviceID string, models []ollamaModel) error {
 	modelIDs := make([]string, 0, len(models))
 	for _, m := range models {
@@ -427,6 +508,10 @@ func (r *Runner) syncDeviceModels(ctx context.Context, deviceID string, models [
 		if m.Size > 0 {
 			sizeGB = float64(m.Size) / (1024 * 1024 * 1024)
 		}
+		tier := inferTier(paramsB, name)
+		thinking := inferThinking(name, m.Details.Family)
+		contextK := inferContextK(name, m.Details.Family)
+		kind := inferKind(name)
 		meta := map[string]any{
 			"digest":     m.Digest,
 			"size_bytes": m.Size,
@@ -438,17 +523,21 @@ func (r *Runner) syncDeviceModels(ctx context.Context, deviceID string, models [
 		}
 		metaJSON, _ := json.Marshal(meta)
 		_, _ = r.DB.Exec(ctx, `
-			INSERT INTO models (id, provider, family, kind, params_b, size_gb, quant, meta, updated_at)
-			VALUES ($1, 'ollama', $2, 'chat', $3, $4, $5, $6::jsonb, now())
+			INSERT INTO models (id, provider, family, kind, params_b, size_gb, quant, tier, thinking, context_k, meta, updated_at)
+			VALUES ($1, 'ollama', $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, now())
 			ON CONFLICT (id) DO UPDATE SET
 			  provider = excluded.provider,
 			  family = excluded.family,
+			  kind = excluded.kind,
 			  params_b = excluded.params_b,
 			  size_gb = excluded.size_gb,
 			  quant = excluded.quant,
+			  tier = excluded.tier,
+			  thinking = excluded.thinking,
+			  context_k = excluded.context_k,
 			  meta = excluded.meta,
 			  updated_at = now()
-		`, name, m.Details.Family, paramsB, nullableFloat(sizeGB), m.Details.QuantizationLevel, metaJSON)
+		`, name, m.Details.Family, kind, paramsB, nullableFloat(sizeGB), m.Details.QuantizationLevel, tier, thinking, contextK, metaJSON)
 
 		_, _ = r.DB.Exec(ctx, `
 			INSERT INTO device_models (device_id, model_id, available, meta, updated_at)

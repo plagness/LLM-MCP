@@ -196,6 +196,29 @@ def _should_mark_offline(exc: Exception) -> bool:
     return False
 
 
+def _calc_cost(payload: dict, tokens_in: int, tokens_out: int) -> str:
+    """Рассчитать стоимость из pricing, переданного в payload."""
+    price_in = float(payload.get("_price_in_1m") or 0)
+    price_out = float(payload.get("_price_out_1m") or 0)
+    cost = (price_in / 1_000_000 * tokens_in) + (price_out / 1_000_000 * tokens_out)
+    return f"{cost:.5f}$"
+
+
+import re
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_thinking(text: str) -> tuple[str, str]:
+    """Разделить текст на thinking и response по <think> тегам."""
+    m = _THINK_RE.search(text)
+    if not m:
+        return "", text
+    thinking = m.group(1).strip()
+    response = (text[:m.start()] + text[m.end():]).strip()
+    return thinking, response
+
+
 def _ollama_generate(payload: dict):
     base = _resolve_ollama_base(payload)
     model = payload.get("model") or os.getenv("OLLAMA_MODEL", "llama3.2:3b")
@@ -281,7 +304,7 @@ def _openrouter_chat(payload: dict):
     if not api_key:
         raise RuntimeError("missing OPENROUTER_API_KEY")
     base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions").rstrip("/")
-    model = payload.get("model") or os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash")
+    model = payload.get("model") or os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
     messages = payload.get("messages") or []
     req = {
         "model": model,
@@ -307,33 +330,120 @@ def _openrouter_chat(payload: dict):
 def _handle_job(kind: str, payload: dict) -> tuple[dict, dict]:
     if kind == "ollama.generate":
         resp = _ollama_generate(payload)
-        return {"ok": True, "provider": "ollama", "data": resp["data"]}, {"ms": resp["ms"]}
+        data = resp.get("data") or {}
+        want_thinking = payload.get("thinking", True)
+        tokens_in = int(data.get("prompt_eval_count") or 0)
+        tokens_out = int(data.get("eval_count") or 0)
+        model = payload.get("model") or ""
+
+        # Разделение thinking и response
+        raw_response = data.get("response", "")
+        thinking_text = data.get("thinking", "")
+        if not thinking_text and "<think>" in raw_response:
+            thinking_text, raw_response = _split_thinking(raw_response)
+
+        result = {
+            "ok": True,
+            "response": raw_response,
+            "model": model,
+            "provider": "ollama",
+            "device_id": payload.get("device_id", ""),
+            "tier": payload.get("_tier", ""),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost": _calc_cost(payload, tokens_in, tokens_out),
+            "data": data,
+        }
+        if want_thinking and thinking_text:
+            result["thinking"] = thinking_text
+
+        return result, {"ms": resp["ms"]}
+
     if kind == "ollama.embed":
         resp = _ollama_embed(payload)
         return {"ok": True, "provider": "ollama", "data": resp["data"]}, {"ms": resp["ms"]}
+
     if kind == "benchmark.ollama.generate":
         return _benchmark_ollama_generate(payload)
     if kind == "benchmark.ollama.embed":
         return _benchmark_ollama_embed(payload)
+
     if kind == "openai.chat":
         resp = _openai_chat(payload)
         usage = resp.get("usage", {})
-        return {"ok": True, "provider": "openai", "data": resp["data"]}, {
-            "ms": resp["ms"],
-            "model": resp.get("model", ""),
+        data = resp.get("data") or {}
+        tokens_in = usage.get("tokens_in", 0)
+        tokens_out = usage.get("tokens_out", 0)
+        model = resp.get("model", "")
+
+        content = ""
+        reasoning = ""
+        choices = data.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            content = msg.get("content", "")
+            reasoning = msg.get("reasoning", "")
+
+        want_thinking = payload.get("thinking", True)
+        result = {
+            "ok": True,
+            "response": content,
+            "model": model,
             "provider": "openai",
-            "tokens_in": usage.get("tokens_in", 0),
-            "tokens_out": usage.get("tokens_out", 0),
+            "tier": payload.get("_tier", ""),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost": _calc_cost(payload, tokens_in, tokens_out),
+            "data": data,
         }
+        if want_thinking and reasoning:
+            result["thinking"] = reasoning
+
+        return result, {
+            "ms": resp["ms"],
+            "model": model,
+            "provider": "openai",
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }
+
     if kind == "openrouter.chat":
         resp = _openrouter_chat(payload)
         usage = resp.get("usage", {})
-        return {"ok": True, "provider": "openrouter", "data": resp["data"]}, {
-            "ms": resp["ms"],
-            "model": resp.get("model", ""),
+        data = resp.get("data") or {}
+        tokens_in = usage.get("tokens_in", 0)
+        tokens_out = usage.get("tokens_out", 0)
+        model = resp.get("model", "")
+
+        content = ""
+        reasoning = ""
+        choices = data.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            content = msg.get("content", "")
+            reasoning = msg.get("reasoning", "")
+
+        want_thinking = payload.get("thinking", True)
+        result = {
+            "ok": True,
+            "response": content,
+            "model": model,
             "provider": "openrouter",
-            "tokens_in": usage.get("tokens_in", 0),
-            "tokens_out": usage.get("tokens_out", 0),
+            "tier": payload.get("_tier", ""),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost": _calc_cost(payload, tokens_in, tokens_out),
+            "data": data,
+        }
+        if want_thinking and reasoning:
+            result["thinking"] = reasoning
+
+        return result, {
+            "ms": resp["ms"],
+            "model": model,
+            "provider": "openrouter",
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
         }
 
     return {"ok": True, "echo": payload}, {"ms": 0}

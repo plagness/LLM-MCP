@@ -46,4 +46,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/benchmarks", s.HandleBenchmarksList)
 	mux.HandleFunc("/v1/costs/summary", s.HandleCostsSummary)
 	mux.HandleFunc("/v1/dashboard", s.HandleDashboard)
+	mux.HandleFunc("/v1/debug/health", s.HandleDebugHealth)
+	mux.HandleFunc("/v1/debug/actions", s.HandleDebugActions)
+	mux.HandleFunc("/v1/debug/capacity", s.HandleDebugCapacity)
+	mux.HandleFunc("/v1/debug/test", s.HandleDebugTest)
 }

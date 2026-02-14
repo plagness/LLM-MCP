@@ -107,6 +107,11 @@ spec:
             configMapKeyRef:
               name: llm-config
               key: OLLAMA_BASE_URL
+        - name: DEVICE_MAX_CONCURRENCY
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: DEVICE_MAX_CONCURRENCY
         volumeMounts:
         # Tailscale binary для сетевого взаимодействия
         - name: tailscale-bin

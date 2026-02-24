@@ -1,0 +1,70 @@
+# Integrat — определение плагина llm-mcp
+# Мультинодовый LLM-роутер
+
+plugin:
+  slug: llm-mcp
+  name: LLM Core
+  description: Мультинодовый LLM-роутер — запросы к моделям, статистика, бенчмарки
+  version: 2026.02.12
+  homepage: https://github.com/plagness/LLM-MCP
+
+provider:
+  base_url: ${LLM_CORE_URL}
+  health_path: /health
+  proxy_mode: rest
+
+endpoints:
+  - slug: llm.request
+    name: LLM запрос
+    description: Отправка запроса к LLM через smart routing
+    path: /v1/llm/request
+    method: POST
+    access: open
+    cache_ttl: 0
+    data_type: complex
+    params_schema:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+        quality:
+          type: string
+          enum: [fast, balanced, quality]
+          default: balanced
+        max_tokens:
+          type: integer
+          default: 1024
+
+  - slug: llm.dashboard
+    name: Dashboard
+    description: Состояние LLM-инфраструктуры — ноды, модели, очереди
+    path: /v1/dashboard
+    method: GET
+    access: gated
+    cache_ttl: 60
+    data_type: complex
+
+  - slug: llm.costs
+    name: Статистика расходов
+    description: Сводка расходов на LLM-запросы
+    path: /v1/costs/summary
+    method: GET
+    access: gated
+    cache_ttl: 300
+    data_type: basic
+
+  - slug: llm.benchmarks
+    name: Бенчмарки
+    description: Результаты бенчмарков LLM-моделей
+    path: /v1/benchmarks
+    method: GET
+    access: open
+    cache_ttl: 120
+    data_type: basic
+
+# ИСКЛЮЧЁННЫЕ эндпоинты (внутренние):
+# - /v1/workers/*    — управление воркерами
+# - /v1/devices/*    — управление устройствами
+# - /v1/debug/*      — отладочные эндпоинты
+# - /v1/discovery/*  — discovery механизм

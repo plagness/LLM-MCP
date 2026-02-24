@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -24,23 +24,23 @@ import (
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	WriteJSON(w, http.StatusOK, models.HealthResp{Status: "ok", Version: s.Version})
 }
 
 func (s *Server) HandleJobs(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.SubmitJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.Kind) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "kind_required"})
+		WriteError(w, http.StatusBadRequest, "kind_required", "Поле kind обязательно")
 		return
 	}
 	if len(req.Payload) == 0 {
@@ -54,7 +54,7 @@ func (s *Server) HandleJobs(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.DeadlineAt) != "" {
 		t, err := time.Parse(time.RFC3339, req.DeadlineAt)
 		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_deadline_at"})
+			WriteError(w, http.StatusBadRequest, "invalid_deadline_at", "Невалидный формат deadline_at (ожидается RFC3339)")
 			return
 		}
 		deadline = &t
@@ -67,7 +67,7 @@ func (s *Server) HandleJobs(w http.ResponseWriter, r *http.Request) {
 		model, device := routing.ParsePayloadModelDevice(req.Payload)
 		if model != "" && device != "" {
 			if ok, reason := limits.ModelAllowed(ctx, s.DB, device, model); !ok {
-				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "model_not_allowed", "reason": reason})
+				WriteError(w, http.StatusBadRequest, "model_not_allowed", "Модель не разрешена для устройства: "+reason)
 				return
 			}
 		}
@@ -81,19 +81,19 @@ func (s *Server) HandleJobs(w http.ResponseWriter, r *http.Request) {
 
 	var jobID string
 	if err := row.Scan(&jobID); err != nil {
-		log.Printf("job enqueue error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_insert_failed"})
+		slog.Error("job enqueue error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_insert_failed", "Ошибка записи в БД")
 		return
 	}
-	log.Printf("job enqueued id=%s kind=%s priority=%d", jobID, req.Kind, req.Priority)
+	slog.Info("job enqueued", "component", "http", "job_id", jobID, "kind", req.Kind, "priority", req.Priority)
 	WriteJSON(w, http.StatusAccepted, models.SubmitJobResponse{JobID: jobID})
 }
 
 func (s *Server) HandleJobByID(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	path := strings.TrimPrefix(r.URL.Path, "/v1/jobs/")
 	if path == "" {
-		WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		WriteError(w, http.StatusNotFound, "not_found", "Ресурс не найден")
 		return
 	}
 	if strings.HasSuffix(path, "/stream") {
@@ -102,12 +102,12 @@ func (s *Server) HandleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	jobID := path
 	if !uuidRe.MatchString(jobID) {
-		WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		WriteError(w, http.StatusNotFound, "not_found", "Ресурс не найден")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -115,24 +115,24 @@ func (s *Server) HandleJobByID(w http.ResponseWriter, r *http.Request) {
 	jobRow, err := s.fetchJob(ctx, jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
-			WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+			WriteError(w, http.StatusNotFound, "not_found", "Ресурс не найден")
 			return
 		}
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+		WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 		return
 	}
 	WriteJSON(w, http.StatusOK, jobRow)
 }
 
 func (s *Server) HandleWorkerRegister(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.RegisterWorkerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	workerID := strings.TrimSpace(req.Worker.ID)
@@ -158,27 +158,27 @@ func (s *Server) HandleWorkerRegister(w http.ResponseWriter, r *http.Request) {
 		  updated_at = now()
 	`, workerID, req.Worker.Name, req.Worker.Platform, req.Worker.Arch, req.Worker.Host, req.Worker.Tags)
 	if err != nil {
-		log.Printf("worker register db error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_upsert_failed"})
+		slog.Error("worker register db error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_upsert_failed", "Ошибка upsert в БД")
 		return
 	}
-	log.Printf("worker registered id=%s name=%s platform=%s arch=%s", workerID, req.Worker.Name, req.Worker.Platform, req.Worker.Arch)
+	slog.Info("worker registered", "component", "http", "worker_id", workerID, "name", req.Worker.Name, "platform", req.Worker.Platform, "arch", req.Worker.Arch)
 	WriteJSON(w, http.StatusOK, models.RegisterWorkerResponse{WorkerID: workerID})
 }
 
 func (s *Server) HandleWorkerClaim(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.ClaimJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.WorkerID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id_required"})
+		WriteError(w, http.StatusBadRequest, "worker_id_required", "Поле worker_id обязательно")
 		return
 	}
 	leaseSeconds := req.LeaseSeconds
@@ -195,8 +195,8 @@ func (s *Server) HandleWorkerClaim(w http.ResponseWriter, r *http.Request) {
 
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
-		log.Printf("worker claim begin error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_tx_failed"})
+		slog.Error("worker claim begin error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_tx_failed", "Ошибка начала транзакции")
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -251,12 +251,12 @@ func (s *Server) HandleWorkerClaim(w http.ResponseWriter, r *http.Request) {
 		&j.LeaseUntil, &j.DeadlineAt, &result, &errText, &j.Priority, &j.QueuedAt, &j.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("worker claim: empty queue worker=%s", req.WorkerID)
+			slog.Info("worker claim: empty queue", "component", "http", "worker_id", req.WorkerID)
 			WriteJSON(w, http.StatusOK, models.ClaimJobResponse{Job: nil})
 			return
 		}
-		log.Printf("worker claim scan error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+		slog.Error("worker claim scan error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 		return
 	}
 	if errText.Valid {
@@ -269,38 +269,38 @@ func (s *Server) HandleWorkerClaim(w http.ResponseWriter, r *http.Request) {
 		UPDATE jobs SET status='running', attempts=attempts+1, lease_until=$1, updated_at=now() WHERE id=$2
 	`, leaseUntil, j.ID)
 	if err != nil {
-		log.Printf("worker claim update error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_update_failed"})
+		slog.Error("worker claim update error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_update_failed", "Ошибка обновления в БД")
 		return
 	}
 	_, _ = tx.Exec(ctx, `INSERT INTO job_attempts (job_id, worker_id, status) VALUES ($1, $2, 'running')`, j.ID, req.WorkerID)
 
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("worker claim commit error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_commit_failed"})
+		slog.Error("worker claim commit error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_commit_failed", "Ошибка коммита транзакции")
 		return
 	}
 
 	j.Attempts += 1
 	j.Status = "running"
 	j.LeaseUntil = &leaseUntil
-	log.Printf("job claimed id=%s worker=%s kind=%s attempts=%d", j.ID, req.WorkerID, j.Kind, j.Attempts)
+	slog.Info("job claimed", "component", "http", "job_id", j.ID, "worker_id", req.WorkerID, "kind", j.Kind, "attempts", j.Attempts)
 	WriteJSON(w, http.StatusOK, models.ClaimJobResponse{Job: &j})
 }
 
 func (s *Server) HandleWorkerComplete(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.CompleteJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.JobID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id_job_id_required"})
+		WriteError(w, http.StatusBadRequest, "worker_id_job_id_required", "Поля worker_id и job_id обязательны")
 		return
 	}
 	if len(req.Result) == 0 {
@@ -316,8 +316,8 @@ func (s *Server) HandleWorkerComplete(w http.ResponseWriter, r *http.Request) {
 		UPDATE jobs SET status='done', result=$1::jsonb, lease_until=NULL, updated_at=now() WHERE id=$2
 	`, req.Result, req.JobID)
 	if err != nil {
-		log.Printf("worker complete update error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_update_failed"})
+		slog.Error("worker complete update error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_update_failed", "Ошибка обновления в БД")
 		return
 	}
 	_, _ = s.DB.Exec(ctx, `
@@ -338,23 +338,23 @@ func (s *Server) HandleWorkerComplete(w http.ResponseWriter, r *http.Request) {
 		s.Router.RecordDeviceResult(deviceID, true)
 	}
 
-	log.Printf("job complete id=%s worker=%s", req.JobID, req.WorkerID)
+	slog.Info("job complete", "component", "http", "job_id", req.JobID, "worker_id", req.WorkerID)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) HandleWorkerFail(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.FailJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.JobID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id_job_id_required"})
+		WriteError(w, http.StatusBadRequest, "worker_id_job_id_required", "Поля worker_id и job_id обязательны")
 		return
 	}
 	if len(req.Metrics) == 0 {
@@ -369,11 +369,11 @@ func (s *Server) HandleWorkerFail(w http.ResponseWriter, r *http.Request) {
 	row := s.DB.QueryRow(ctx, `SELECT attempts, max_attempts FROM jobs WHERE id=$1`, req.JobID)
 	if err := row.Scan(&attempts, &maxAttempts); err != nil {
 		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
-			WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+			WriteError(w, http.StatusNotFound, "not_found", "Ресурс не найден")
 			return
 		}
-		log.Printf("worker fail read error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+		slog.Error("worker fail read error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 		return
 	}
 	status := "queued"
@@ -384,8 +384,8 @@ func (s *Server) HandleWorkerFail(w http.ResponseWriter, r *http.Request) {
 		UPDATE jobs SET status=$1, error=$2, lease_until=NULL, updated_at=now() WHERE id=$3
 	`, status, req.Error, req.JobID)
 	if err != nil {
-		log.Printf("worker fail update error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_update_failed"})
+		slog.Error("worker fail update error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_update_failed", "Ошибка обновления в БД")
 		return
 	}
 	_, _ = s.DB.Exec(ctx, `
@@ -402,23 +402,23 @@ func (s *Server) HandleWorkerFail(w http.ResponseWriter, r *http.Request) {
 		s.Router.RecordDeviceResult(deviceID, false)
 	}
 
-	log.Printf("job failed id=%s worker=%s status=%s error=%s", req.JobID, req.WorkerID, status, req.Error)
+	slog.Error("job failed", "component", "http", "job_id", req.JobID, "worker_id", req.WorkerID, "status", status, "error", req.Error)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) HandleWorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.JobID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id_job_id_required"})
+		WriteError(w, http.StatusBadRequest, "worker_id_job_id_required", "Поля worker_id и job_id обязательны")
 		return
 	}
 	if req.ExtendSeconds <= 0 {
@@ -432,27 +432,27 @@ func (s *Server) HandleWorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		UPDATE jobs SET lease_until=$1, updated_at=now() WHERE id=$2 AND status='running'
 	`, leaseUntil, req.JobID)
 	if err != nil {
-		log.Printf("worker heartbeat update error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_update_failed"})
+		slog.Error("worker heartbeat update error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_update_failed", "Ошибка обновления в БД")
 		return
 	}
-	log.Printf("job heartbeat id=%s worker=%s extend=%ds", req.JobID, req.WorkerID, req.ExtendSeconds)
+	slog.Info("job heartbeat", "component", "http", "job_id", req.JobID, "worker_id", req.WorkerID, "extend_seconds", req.ExtendSeconds)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) HandleDeviceOffline(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.DeviceOfflineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	if strings.TrimSpace(req.DeviceID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id_required"})
+		WriteError(w, http.StatusBadRequest, "device_id_required", "Поле device_id обязательно")
 		return
 	}
 	meta := map[string]any{
@@ -466,22 +466,22 @@ func (s *Server) HandleDeviceOffline(w http.ResponseWriter, r *http.Request) {
 		UPDATE devices SET status='offline', tags = COALESCE(tags, '{}'::jsonb) || $1::jsonb, updated_at=now() WHERE id=$2
 	`, metaJSON, req.DeviceID)
 	if err != nil {
-		log.Printf("device offline update error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_update_failed"})
+		slog.Error("device offline update error", "component", "http", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_update_failed", "Ошибка обновления в БД")
 		return
 	}
-	log.Printf("device marked offline id=%s reason=%s", req.DeviceID, req.Reason)
+	slog.Info("device marked offline", "component", "http", "device_id", req.DeviceID, "reason", req.Reason)
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID string) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	if !uuidRe.MatchString(jobID) {
-		WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		WriteError(w, http.StatusNotFound, "not_found", "Ресурс не найден")
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -490,7 +490,7 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID s
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "stream_not_supported"})
+		WriteError(w, http.StatusInternalServerError, "stream_not_supported", "SSE streaming не поддерживается")
 		return
 	}
 
@@ -499,8 +499,8 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID s
 	// Получаем dedicated connection для LISTEN
 	conn, err := s.DB.Acquire(ctx)
 	if err != nil {
-		log.Printf("sse: acquire conn error: %v", err)
-		WriteSSE(w, "error", map[string]string{"error": "db_conn_failed"})
+		slog.Error("sse: acquire conn error", "component", "http", "error", err)
+		WriteSSE(w, "error", models.ErrorResp{Error: "db_conn_failed", Message: "Ошибка подключения к БД"})
 		flusher.Flush()
 		return
 	}
@@ -509,7 +509,7 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID s
 	// Подписываемся на канал job_update
 	_, err = conn.Exec(ctx, "LISTEN job_update")
 	if err != nil {
-		log.Printf("sse: LISTEN error: %v", err)
+		slog.Error("sse: LISTEN error", "component", "http", "error", err)
 		// Fallback на polling при ошибке LISTEN
 		s.handleJobStreamPoll(w, r, jobID, flusher)
 		return
@@ -520,11 +520,11 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request, jobID s
 	jobRow, err := s.fetchJob(ctx, jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
-			WriteSSE(w, "error", map[string]string{"error": "not_found"})
+			WriteSSE(w, "error", models.ErrorResp{Error: "not_found", Message: "Job не найден"})
 			flusher.Flush()
 			return
 		}
-		WriteSSE(w, "error", map[string]string{"error": "db_read_failed"})
+		WriteSSE(w, "error", models.ErrorResp{Error: "db_read_failed", Message: "Ошибка чтения из БД"})
 		flusher.Flush()
 		return
 	}
@@ -585,7 +585,7 @@ func (s *Server) handleJobStreamPoll(w http.ResponseWriter, r *http.Request, job
 			jobRow, err := s.fetchJob(ctx, jobID)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
-					WriteSSE(w, "error", map[string]string{"error": "not_found"})
+					WriteSSE(w, "error", models.ErrorResp{Error: "not_found", Message: "Job не найден"})
 					flusher.Flush()
 					return
 				}
@@ -604,24 +604,24 @@ func (s *Server) handleJobStreamPoll(w http.ResponseWriter, r *http.Request, job
 }
 
 func (s *Server) HandleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	if err := s.Discovery.Run(ctx); err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "discovery_failed"})
+		WriteError(w, http.StatusInternalServerError, "discovery_failed", "Ошибка запуска discovery")
 		return
 	}
 	WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) HandleDiscoveryLast(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	last := s.Discovery.LastRun()
@@ -639,21 +639,21 @@ var qualityTimeouts = map[string]int{
 }
 
 func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.LLMRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	provider, kind, payload, err := s.Router.RouteLLM(ctx, req)
 	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		WriteError(w, http.StatusBadRequest, "routing_failed", err.Error())
 		return
 	}
 	if req.MaxAttempts == 0 {
@@ -664,7 +664,7 @@ func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.DeadlineAt) != "" {
 		t, err := time.Parse(time.RFC3339, req.DeadlineAt)
 		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_deadline_at"})
+			WriteError(w, http.StatusBadRequest, "invalid_deadline_at", "Невалидный формат deadline_at (ожидается RFC3339)")
 			return
 		}
 		deadline = &t
@@ -685,23 +685,23 @@ func (s *Server) HandleLLMRequest(w http.ResponseWriter, r *http.Request) {
 	`, kind, payload, req.Priority, req.Source, req.MaxAttempts, deadline)
 	var jobID string
 	if err := row.Scan(&jobID); err != nil {
-		log.Printf("llm request enqueue error: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_insert_failed"})
+		slog.Error("llm request enqueue error", "component", "llm", "error", err)
+		WriteError(w, http.StatusInternalServerError, "db_insert_failed", "Ошибка записи в БД")
 		return
 	}
-	log.Printf("llm route provider=%s kind=%s job=%s quality=%s", provider, kind, jobID, req.Quality)
+	slog.Info("llm route", "component", "llm", "provider", provider, "kind", kind, "job_id", jobID, "quality", req.Quality)
 	WriteJSON(w, http.StatusAccepted, models.LLMResponse{JobID: jobID, Provider: provider, Kind: kind})
 }
 
 func (s *Server) HandleBenchmarkRun(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	var req models.BenchmarkRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Невалидный JSON в теле запроса")
 		return
 	}
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
@@ -713,7 +713,7 @@ func (s *Server) HandleBenchmarkRun(w http.ResponseWriter, r *http.Request) {
 		task = "generate"
 	}
 	if provider != "ollama" {
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_not_supported"})
+		WriteError(w, http.StatusBadRequest, "provider_not_supported", "Бенчмарк поддерживает только провайдер ollama")
 		return
 	}
 	kind := "benchmark.ollama." + task
@@ -732,17 +732,17 @@ func (s *Server) HandleBenchmarkRun(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.DeviceID) != "" {
 		if req.Model != "" {
 			if ok, reason := limits.ModelAllowed(ctx, s.DB, req.DeviceID, req.Model); !ok {
-				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "model_not_allowed", "reason": reason})
+				WriteError(w, http.StatusBadRequest, "model_not_allowed", "Модель не разрешена для устройства: "+reason)
 				return
 			}
 		}
 		addr, host, err := s.Router.FetchDeviceAddr(ctx, req.DeviceID)
 		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "device_not_found"})
+			WriteError(w, http.StatusBadRequest, "device_not_found", "Устройство не найдено")
 			return
 		}
 		if addr == "" {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "device_no_ollama_addr"})
+			WriteError(w, http.StatusBadRequest, "device_no_ollama_addr", "У устройства нет ollama_addr")
 			return
 		}
 		payload["ollama_addr"] = addr
@@ -762,20 +762,20 @@ func (s *Server) HandleBenchmarkRun(w http.ResponseWriter, r *http.Request) {
 		`, kind, payloadJSON, req.Priority, "benchmark", 2)
 		var jobID string
 		if err := row.Scan(&jobID); err != nil {
-			log.Printf("benchmark enqueue error: %v", err)
-			WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_insert_failed"})
+			slog.Error("benchmark enqueue error", "component", "http", "error", err)
+			WriteError(w, http.StatusInternalServerError, "db_insert_failed", "Ошибка записи в БД")
 			return
 		}
 		jobIDs = append(jobIDs, jobID)
 	}
-	log.Printf("benchmark queued kind=%s runs=%d", kind, len(jobIDs))
+	slog.Info("benchmark queued", "component", "http", "kind", kind, "runs", len(jobIDs))
 	WriteJSON(w, http.StatusAccepted, map[string]any{"job_ids": jobIDs, "kind": kind})
 }
 
 func (s *Server) HandleBenchmarksList(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	limit := 20
@@ -791,7 +791,7 @@ func (s *Server) HandleBenchmarksList(w http.ResponseWriter, r *http.Request) {
 		FROM benchmarks ORDER BY created_at DESC LIMIT $1
 	`, limit)
 	if err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+		WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 		return
 	}
 	defer rows.Close()
@@ -850,7 +850,7 @@ func (s *Server) RecordCost(ctx context.Context, jobID string, metricsRaw json.R
 	var cost float64
 	row := s.DB.QueryRow(ctx, `SELECT calculate_job_cost($1, $2, $3)`, model, tokensIn, tokensOut)
 	if err := row.Scan(&cost); err != nil {
-		log.Printf("cost calc error job=%s: %v", jobID, err)
+		slog.Warn("cost calc error", "component", "http", "job_id", jobID, "error", err)
 		cost = 0
 	}
 	_, err := s.DB.Exec(ctx, `
@@ -858,17 +858,17 @@ func (s *Server) RecordCost(ctx context.Context, jobID string, metricsRaw json.R
 		VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6)
 	`, jobID, model, provider, tokensIn, tokensOut, cost)
 	if err != nil {
-		log.Printf("cost insert error job=%s: %v", jobID, err)
+		slog.Error("cost insert error", "component", "http", "job_id", jobID, "error", err)
 	} else {
-		log.Printf("cost recorded job=%s model=%s provider=%s tokens=%d/%d cost=%.6f", jobID, model, provider, tokensIn, tokensOut, cost)
+		slog.Info("cost recorded", "component", "http", "job_id", jobID, "model", model, "provider", provider, "tokens_in", tokensIn, "tokens_out", tokensOut, "cost", cost)
 	}
 }
 
 // HandleCostsSummary возвращает агрегацию расходов за период
 func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	period := r.URL.Query().Get("period")
@@ -885,7 +885,7 @@ func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
 	case "month":
 		interval = "30 days"
 	default:
-		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_period"})
+		WriteError(w, http.StatusBadRequest, "invalid_period", "Невалидный период: допустимые значения day, week, month")
 		return
 	}
 
@@ -907,7 +907,7 @@ func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
 			SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM llm_costs WHERE created_at >= now() - $1::interval
 		`, interval).Scan(&totalCost, &totalJobs)
 		if err != nil {
-			WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+			WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 			return
 		}
 
@@ -918,7 +918,7 @@ func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
 			GROUP BY provider ORDER BY cost DESC
 		`, interval)
 		if err != nil {
-			WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "db_read_failed"})
+			WriteError(w, http.StatusInternalServerError, "db_read_failed", "Ошибка чтения из БД")
 			return
 		}
 		defer rows.Close()
@@ -942,9 +942,9 @@ func (s *Server) HandleCostsSummary(w http.ResponseWriter, r *http.Request) {
 
 // HandleDashboard возвращает полный snapshot для web UI
 func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1366,9 +1366,9 @@ func extractDeviceIDFromJob(ctx context.Context, s *Server, jobID string) string
 
 // HandleDebugHealth — глубокая диагностика всех компонентов
 func (s *Server) HandleDebugHealth(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1516,9 +1516,9 @@ func (s *Server) HandleDebugHealth(w http.ResponseWriter, r *http.Request) {
 
 // HandleDebugActions — каталог всех API endpoints
 func (s *Server) HandleDebugActions(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 
@@ -1562,9 +1562,9 @@ func (s *Server) HandleDebugActions(w http.ResponseWriter, r *http.Request) {
 
 // HandleDebugCapacity — мощности кластера: слоты, загрузка, утилизация
 func (s *Server) HandleDebugCapacity(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodGet {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1689,9 +1689,9 @@ func (s *Server) HandleDebugCapacity(w http.ResponseWriter, r *http.Request) {
 
 // HandleDebugTest — smoke test: проверяет БД, Ollama, job pipeline
 func (s *Server) HandleDebugTest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("http %s %s", r.Method, r.URL.Path)
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
 	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Метод не разрешён")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)

@@ -2,7 +2,7 @@ package discovery
 
 import (
 	"context"
-	"log"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -14,7 +14,7 @@ func HandleOfflineDevices(ctx context.Context, db *pgxpool.Pool, offlineDeviceID
 		return nil
 	}
 
-	log.Printf("discovery: handling offline devices count=%d", len(offlineDeviceIDs))
+	slog.Info("handling offline devices", "component", "discovery", "count", len(offlineDeviceIDs))
 
 	// Сбрасываем lease для всех running jobs на offline устройствах
 	tag, err := db.Exec(ctx, `
@@ -31,7 +31,7 @@ func HandleOfflineDevices(ctx context.Context, db *pgxpool.Pool, offlineDeviceID
 
 	affected := tag.RowsAffected()
 	if affected > 0 {
-		log.Printf("discovery: reset lease for %d running jobs on offline devices", affected)
+		slog.Info("reset lease for running jobs on offline devices", "component", "discovery", "affected", affected)
 	}
 
 	return nil

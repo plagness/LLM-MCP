@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+
+	"llm-mcp/core/internal/models"
 )
 
 // WriteJSON отправляет JSON-ответ
@@ -10,6 +12,11 @@ func WriteJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// WriteError отправляет ошибку в едином формате (NeuronSwarm Error Contract)
+func WriteError(w http.ResponseWriter, status int, code, message string) {
+	WriteJSON(w, status, models.ErrorResp{Error: code, Message: message})
 }
 
 // WriteSSE отправляет SSE event

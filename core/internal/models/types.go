@@ -10,6 +10,13 @@ type HealthResp struct {
 	Version string `json:"version"`
 }
 
+// ErrorResp — единый формат ошибок (NeuronSwarm Error Contract)
+type ErrorResp struct {
+	Error   string `json:"error"`             // machine-readable код: snake_case
+	Message string `json:"message,omitempty"`  // человекочитаемое описание
+	Details string `json:"details,omitempty"`  // технические детали (optional)
+}
+
 type SubmitJobRequest struct {
 	Kind        string          `json:"kind"`
 	Payload     json.RawMessage `json:"payload"`

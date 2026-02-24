@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -76,7 +76,7 @@ func tailscaleAvailable() bool {
 
 func (r *Runner) Run(ctx context.Context) error {
 	start := time.Now()
-	log.Printf("discovery: start")
+	slog.Info("discovery start", "component", "discovery")
 
 	hasTailscale := tailscaleAvailable()
 	var status tailStatus
@@ -85,9 +85,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	if hasTailscale {
 		out, err := exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
 		if err != nil {
-			log.Printf("discovery: tailscale status error (continuing without): %v", err)
+			slog.Warn("tailscale status error (continuing without)", "component", "discovery", "error", err)
 		} else if err := json.Unmarshal(out, &status); err != nil {
-			log.Printf("discovery: tailscale json parse error (continuing without): %v", err)
+			slog.Warn("tailscale json parse error (continuing without)", "component", "discovery", "error", err)
 		} else {
 			processNode := func(node tailNode) {
 				id := node.DNSName
@@ -104,7 +104,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				addrs := buildAddrs(node)
 				hostHeaders := buildHostHeaders(node)
 				if err := r.upsertDevice(ctx, id, node, ip, addrs, hostHeaders); err != nil {
-					log.Printf("discovery: upsert error id=%s err=%v", id, err)
+					slog.Error("upsert error", "component", "discovery", "device_id", id, "error", err)
 					return
 				}
 				if node.Online {
@@ -119,7 +119,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 	} else {
-		log.Printf("discovery: tailscale not found, skipping mesh discovery")
+		slog.Info("tailscale not found, skipping mesh discovery", "component", "discovery")
 	}
 
 	// Subnet scan работает независимо от Tailscale
@@ -140,13 +140,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		offlineIDs = r.collectOfflineDeviceIDs(ctx, status)
 		if len(offlineIDs) > 0 {
 			if err := HandleOfflineDevices(ctx, r.DB, offlineIDs); err != nil {
-				log.Printf("discovery: offline handler error: %v", err)
+				slog.Error("offline handler error", "component", "discovery", "error", err)
 			}
 		}
 	}
 
 	r.setLastRun(time.Now())
-	log.Printf("discovery: done peers=%d offline=%d tailscale=%v elapsed=%s", count, len(offlineIDs), hasTailscale, time.Since(start))
+	slog.Info("discovery done", "component", "discovery", "peers", count, "offline", len(offlineIDs), "tailscale", hasTailscale, "elapsed", time.Since(start).String())
 	return nil
 }
 
@@ -230,7 +230,7 @@ func (r *Runner) probeOllama(ctx context.Context, deviceID string, addrs []strin
 		if port != 11434 {
 			portDeviceID = deviceID + ":" + strconv.Itoa(port)
 			if err := r.ensurePortDevice(ctx, portDeviceID, deviceID, port); err != nil {
-				log.Printf("discovery: port device error id=%s err=%v", portDeviceID, err)
+				slog.Error("port device error", "component", "discovery", "device_id", portDeviceID, "error", err)
 				continue
 			}
 		}
@@ -290,12 +290,12 @@ func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []s
 			resp, err := client.Do(req)
 			latency := time.Since(start).Milliseconds()
 			if err != nil {
-				log.Printf("discovery: ollama probe fail device=%s addr=%s port=%s host=%s err=%v", deviceID, addr, portStr, host, err)
+				slog.Warn("ollama probe fail", "component", "discovery", "device_id", deviceID, "addr", addr, "port", portStr, "host", host, "error", err)
 				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
 				continue
 			}
 			if resp.StatusCode != http.StatusOK {
-				log.Printf("discovery: ollama probe bad status device=%s addr=%s port=%s host=%s status=%d", deviceID, addr, portStr, host, resp.StatusCode)
+				slog.Warn("ollama probe bad status", "component", "discovery", "device_id", deviceID, "addr", addr, "port", portStr, "host", host, "status", resp.StatusCode)
 				_ = resp.Body.Close()
 				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "status": resp.StatusCode})
 				continue
@@ -305,7 +305,7 @@ func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []s
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 				_ = resp.Body.Close()
-				log.Printf("discovery: ollama decode error device=%s addr=%s port=%s host=%s err=%v", deviceID, addr, portStr, host, err)
+				slog.Warn("ollama decode error", "component", "discovery", "device_id", deviceID, "addr", addr, "port", portStr, "host", host, "error", err)
 				results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": false, "latency_ms": latency, "error": err.Error()})
 				continue
 			}
@@ -318,7 +318,7 @@ func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []s
 				}
 			}
 			if err := r.syncDeviceModels(ctx, deviceID, data.Models); err != nil {
-				log.Printf("discovery: model sync error device=%s err=%v", deviceID, err)
+				slog.Error("model sync error", "component", "discovery", "device_id", deviceID, "error", err)
 			}
 			results = append(results, map[string]any{"addr": addr, "port": port, "host": host, "ok": true, "latency_ms": latency, "models_count": len(models)})
 			if bestAddr == "" || latency < bestLatency {
@@ -354,10 +354,10 @@ func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []s
 		WHERE id = $2
 	`, metaJSON, deviceID)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("discovery: ollama update error device=%s err=%v", deviceID, err)
+		slog.Error("ollama update error", "component", "discovery", "device_id", deviceID, "error", err)
 		return
 	}
-	log.Printf("discovery: ollama ok device=%s addr=%s port=%s host=%s latency=%dms models=%d", deviceID, ollamaAddr, portStr, bestHost, bestLatency, len(bestModels))
+	slog.Info("ollama ok", "component", "discovery", "device_id", deviceID, "addr", ollamaAddr, "port", portStr, "host", bestHost, "latency_ms", bestLatency, "models", len(bestModels))
 }
 
 func formatAddr(addr string) string {
@@ -594,11 +594,11 @@ func nullableFloat(v float64) *float64 {
 func (r *Runner) clearLanDevices(ctx context.Context) {
 	tag, err := r.DB.Exec(ctx, `DELETE FROM devices WHERE id LIKE 'lan-%'`)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("discovery: clear lan devices error: %v", err)
+		slog.Error("clear lan devices error", "component", "discovery", "error", err)
 		return
 	}
 	if tag.RowsAffected() > 0 {
-		log.Printf("discovery: cleared lan devices count=%d", tag.RowsAffected())
+		slog.Info("cleared lan devices", "component", "discovery", "count", tag.RowsAffected())
 	}
 }
 
@@ -617,7 +617,7 @@ func (r *Runner) scanSubnets(ctx context.Context, self tailNode) {
 		}
 	}
 
-	log.Printf("discovery: subnet scan start subnets=%d", len(subnets))
+	slog.Info("subnet scan start", "component", "discovery", "subnets", len(subnets))
 	type job struct {
 		ip string
 	}
@@ -692,7 +692,7 @@ func (r *Runner) scanSubnets(ctx context.Context, self tailNode) {
 	}
 	close(jobs)
 	wg.Wait()
-	log.Printf("discovery: subnet scan done")
+	slog.Info("subnet scan done", "component", "discovery")
 }
 
 func parseSubnets(self tailNode) []string {
@@ -774,10 +774,10 @@ func (r *Runner) upsertLanDevice(ctx context.Context, ip string, models []string
 		  updated_at = now()
 	`, id, id, "lan", "", ip, metaJSON)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("discovery: lan upsert error ip=%s err=%v", ip, err)
+		slog.Error("lan upsert error", "component", "discovery", "ip", ip, "error", err)
 		return
 	}
-	log.Printf("discovery: ollama ok device=%s addr=%s models=%d", id, ip, len(models))
+	slog.Info("ollama ok", "component", "discovery", "device_id", id, "addr", ip, "models", len(models))
 }
 
 func getEnv(key string) string {
@@ -801,7 +801,7 @@ func getOllamaPorts() []int {
 		}
 		port, err := strconv.Atoi(p)
 		if err != nil || port < 1 || port > 65535 {
-			log.Printf("discovery: invalid OLLAMA_PORTS value: %s", p)
+			slog.Warn("invalid OLLAMA_PORTS value", "component", "discovery", "value", p)
 			continue
 		}
 		ports = append(ports, port)

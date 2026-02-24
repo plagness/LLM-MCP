@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
 	"llm-mcp/core/internal/pb"
@@ -47,10 +47,10 @@ func (s *Server) SubmitJob(ctx context.Context, req *pb.SubmitJobRequest) (*pb.S
 
 	var id string
 	if err := row.Scan(&id); err != nil {
-		log.Printf("grpc submit error: %v", err)
+		slog.Error("grpc submit error", "component", "grpc", "error", err)
 		return nil, err
 	}
-	log.Printf("grpc submit job id=%s kind=%s", id, req.Kind)
+	slog.Info("grpc submit job", "component", "grpc", "job_id", id, "kind", req.Kind)
 	return &pb.SubmitJobResponse{JobId: id}, nil
 }
 
@@ -116,10 +116,10 @@ func (s *Server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerReque
 		  updated_at = now()
 	`, workerID, worker.Name, worker.Platform, worker.Arch, worker.Host, tags)
 	if err != nil {
-		log.Printf("grpc register error: %v", err)
+		slog.Error("grpc register error", "component", "grpc", "error", err)
 		return nil, err
 	}
-	log.Printf("grpc worker registered id=%s name=%s", workerID, worker.Name)
+	slog.Info("grpc worker registered", "component", "grpc", "worker_id", workerID, "name", worker.Name)
 	return &pb.RegisterWorkerResponse{WorkerId: workerID}, nil
 }
 
@@ -193,7 +193,7 @@ func (s *Server) ClaimJob(ctx context.Context, req *pb.ClaimJobRequest) (*pb.Cla
 	j.Status = "running"
 	j.LeaseUntil = &leaseUntil
 	job := rowToPB(j)
-	log.Printf("grpc job claimed id=%s worker=%s kind=%s", job.Id, req.WorkerId, job.Kind)
+	slog.Info("grpc job claimed", "component", "grpc", "job_id", job.Id, "worker_id", req.WorkerId, "kind", job.Kind)
 	return &pb.ClaimJobResponse{Job: job}, nil
 }
 
@@ -235,7 +235,7 @@ func (s *Server) CompleteJob(ctx context.Context, req *pb.CompleteJobRequest) (*
 		  LIMIT 1
 		)
 	`, metrics, req.JobId)
-	log.Printf("grpc job complete id=%s worker=%s", req.JobId, req.WorkerId)
+	slog.Info("grpc job complete", "component", "grpc", "job_id", req.JobId, "worker_id", req.WorkerId)
 	return &pb.CompleteJobResponse{Ok: true}, nil
 }
 
@@ -269,7 +269,7 @@ func (s *Server) FailJob(ctx context.Context, req *pb.FailJobRequest) (*pb.FailJ
 		  LIMIT 1
 		)
 	`, req.Error, metrics, req.JobId)
-	log.Printf("grpc job failed id=%s worker=%s status=%s error=%s", req.JobId, req.WorkerId, status, req.Error)
+	slog.Error("grpc job failed", "component", "grpc", "job_id", req.JobId, "worker_id", req.WorkerId, "status", status, "error", req.Error)
 	return &pb.FailJobResponse{Ok: true}, nil
 }
 
@@ -312,17 +312,17 @@ func (s *Server) ReportBenchmark(ctx context.Context, req *pb.ReportBenchmarkReq
 		  provider = excluded.provider,
 		  updated_at = now()
 	`, b.ModelId, meta); err != nil {
-		log.Printf("grpc benchmark model upsert error: %v", err)
+		slog.Error("grpc benchmark model upsert error", "component", "grpc", "error", err)
 	}
 	_, err := s.DB.Exec(ctx, `
 		INSERT INTO benchmarks (device_id, model_id, task_type, tokens_in, tokens_out, latency_ms, tps, meta, ok)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, TRUE)
 	`, b.DeviceId, b.ModelId, b.TaskType, b.TokensIn, b.TokensOut, b.LatencyMs, b.Tps, meta)
 	if err != nil {
-		log.Printf("grpc benchmark insert error: %v", err)
+		slog.Error("grpc benchmark insert error", "component", "grpc", "error", err)
 		return nil, err
 	}
-	log.Printf("grpc benchmark saved device=%s model=%s task=%s tps=%.2f", b.DeviceId, b.ModelId, b.TaskType, b.Tps)
+	slog.Info("grpc benchmark saved", "component", "grpc", "device_id", b.DeviceId, "model_id", b.ModelId, "task_type", b.TaskType, "tps", b.Tps)
 	return &pb.ReportBenchmarkResponse{Ok: true}, nil
 }
 

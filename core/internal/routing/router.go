@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +55,7 @@ func (rt *Router) RecordDeviceResult(deviceID string, success bool) {
 	c.Failures++
 	if c.Failures >= 3 {
 		c.DegradedAt = time.Now()
-		log.Printf("circuit: device %s degraded (failures=%d)", deviceID, c.Failures)
+		slog.Warn("device degraded", "component", "circuit", "device_id", deviceID, "failures", c.Failures)
 	}
 }
 
@@ -196,7 +196,7 @@ func (rt *Router) RouteLLM(ctx context.Context, req models.LLMRequest) (string, 
 				}
 			}
 		}
-		log.Printf("route: task=%s provider=%s kind=%s local=%t", task, provider, kind, localAvailable)
+		slog.Info("route", "component", "routing", "task", task, "provider", provider, "kind", kind, "local", localAvailable)
 		return provider, kind, req.Payload, nil
 	}
 
@@ -269,7 +269,7 @@ func (rt *Router) RouteLLM(ctx context.Context, req models.LLMRequest) (string, 
 	}
 
 	payloadJSON, _ := json.Marshal(payload)
-	log.Printf("route: task=%s provider=%s kind=%s local=%t", task, provider, kind, localAvailable)
+	slog.Info("route", "component", "routing", "task", task, "provider", provider, "kind", kind, "local", localAvailable)
 	return provider, kind, payloadJSON, nil
 }
 
@@ -326,7 +326,7 @@ func (rt *Router) SelectOllamaDevice(ctx context.Context, model string, task str
 	if err := row.Scan(&target.ID, &target.Addr, &target.Host, &tps, &latency); err != nil {
 		return nil
 	}
-	log.Printf("route: device select model=%s task=%s device=%s addr=%s tps=%v latency=%v", model, task, target.ID, target.Addr, tps, latency)
+	slog.Info("device select", "component", "routing", "model", model, "task", task, "device_id", target.ID, "addr", target.Addr, "tps", tps, "latency", latency)
 	return &target
 }
 
@@ -523,8 +523,7 @@ func (rt *Router) routeSmartLLM(ctx context.Context, req models.LLMRequest) (str
 	}
 
 	payloadJSON, _ := json.Marshal(payload)
-	log.Printf("smart_route: quality=%s task=%s model=%s provider=%s tier=%s device=%s tokens~%d reason=%s",
-		quality, task, sel.Model, sel.Provider, sel.Tier, sel.DeviceID, estimatedTokens, sel.Reason)
+	slog.Info("smart_route", "component", "routing", "quality", quality, "task", task, "model", sel.Model, "provider", sel.Provider, "tier", sel.Tier, "device_id", sel.DeviceID, "tokens_est", estimatedTokens, "reason", sel.Reason)
 	return sel.Provider, kind, payloadJSON, nil
 }
 
@@ -572,7 +571,7 @@ func (rt *Router) findLocalModel(ctx context.Context, tiers []string, minContext
 	// Circuit breaker: пропускаем degraded устройства
 	if rt.IsDeviceDegraded(sel.DeviceID) {
 		sel.Reason = "device_degraded"
-		log.Printf("smart_route: skipping degraded device=%s", sel.DeviceID)
+		slog.Warn("skipping degraded device", "component", "routing", "device_id", sel.DeviceID)
 		return nil
 	}
 	sel.Reason = "local_match"

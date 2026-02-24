@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -24,22 +24,26 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	addr := config.Getenv("CORE_HTTP_ADDR", ":8080")
 	grpcAddr := config.Getenv("CORE_GRPC_ADDR", ":9090")
 	version := config.Getenv("CORE_VERSION", config.Getenv("LLM_MCP_VERSION", "0.1.0"))
 	dsn := os.Getenv("DB_DSN")
 	if dsn == "" {
-		log.Fatal("DB_DSN is required")
+		slog.Error("DB_DSN is required")
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		log.Fatalf("db connect error: %v", err)
+		slog.Error("db connect error", "error", err)
+		os.Exit(1)
 	}
 	defer pool.Close()
 	if err := ensureSchema(ctx, pool); err != nil {
-		log.Printf("schema ensure error: %v", err)
+		slog.Warn("schema ensure error", "error", err)
 	}
 
 	disc := discovery.New(pool)
@@ -47,7 +51,7 @@ func main() {
 	srv := api.New(pool, version, disc, router)
 
 	if err := limits.ApplyDeviceLimits(context.Background(), pool); err != nil {
-		log.Printf("device limits apply error: %v", err)
+		slog.Warn("device limits apply error", "error", err)
 	}
 	if interval := config.GetenvInt("DEVICE_LIMITS_INTERVAL", 0); interval > 0 {
 		go func() {
@@ -55,7 +59,7 @@ func main() {
 			defer ticker.Stop()
 			for {
 				if err := limits.ApplyDeviceLimits(context.Background(), pool); err != nil {
-					log.Printf("device limits apply error: %v", err)
+					slog.Warn("device limits apply error", "error", err)
 				}
 				<-ticker.C
 			}
@@ -72,22 +76,25 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("core http listening on %s", addr)
+		slog.Info("core http listening", "component", "http", "addr", addr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http error: %v", err)
+			slog.Error("http error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	go func() {
 		lis, err := net.Listen("tcp", grpcAddr)
 		if err != nil {
-			log.Fatalf("grpc listen error: %v", err)
+			slog.Error("grpc listen error", "error", err)
+			os.Exit(1)
 		}
 		grpcSrv := grpc.NewServer()
 		pb.RegisterCoreServer(grpcSrv, grpcserver.New(pool))
-		log.Printf("core grpc listening on %s", grpcAddr)
+		slog.Info("core grpc listening", "component", "grpc", "addr", grpcAddr)
 		if err := grpcSrv.Serve(lis); err != nil {
-			log.Fatalf("grpc serve error: %v", err)
+			slog.Error("grpc serve error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -111,7 +118,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown error: %v", err)
+		slog.Error("shutdown error", "error", err)
 	}
 }
 

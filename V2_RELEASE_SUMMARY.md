@@ -140,8 +140,8 @@ llm-mcp/
 ## 📚 Документация
 
 ### Руководства:
-1. **[planner/README.md](planner/README.md)**
-   - Описание модуля planner
+1. **[planner/README.md](https://github.com/plagness/Neuron-Swarm/blob/main/planner/README.md)**
+   - Описание модуля planner (в основном репо NeuronSwarm)
    - Архитектура (текущая + будущая)
    - Переменные окружения
 

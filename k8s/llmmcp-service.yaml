@@ -3,6 +3,10 @@ kind: Service
 metadata:
   name: llmmcp
   namespace: ns-llm
+  labels:
+    app: llmmcp
+    ns.component: mcp
+    ns.module: llm
 spec:
   type: ClusterIP
   selector:

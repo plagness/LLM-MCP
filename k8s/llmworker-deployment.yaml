@@ -64,11 +64,11 @@ spec:
               key: LOG_LEVEL
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "100m"
+            memory: "64Mi"
+            cpu: "50m"
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "512Mi"
+            cpu: "500m"
       # Альтернатива hostNetwork: hostAliases для маппинга Ollama
       # hostAliases:
       # - ip: "192.168.1.100"  # IP хост-машины

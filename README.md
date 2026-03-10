@@ -1,6 +1,6 @@
 # LLM-MCP
 
-[![Version](https://img.shields.io/badge/version-2026.02.12-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-2026.03.10-blue.svg)](VERSION)
 [![Runtime](https://img.shields.io/badge/runtime-go%20%2B%20python%20%2B%20node-green.svg)](compose.yml)
 [![Queue](https://img.shields.io/badge/queue-postgres-orange.svg)](db/init)
 [![Transport](https://img.shields.io/badge/transport-http%20%2B%20grpc-7a3cff.svg)](proto/llm.proto)
@@ -87,19 +87,48 @@ curl -fsS http://127.0.0.1:8080/health || true
 curl -fsS http://127.0.0.1:3333/health || true
 ```
 
-## 🔌 Минимальные API точки (MVP)
+## 🔌 API Endpoints
 
+### Job Queue (async)
 - `POST /v1/jobs` — постановка задачи.
 - `GET /v1/jobs/{id}` — статус.
 - `GET /v1/jobs/{id}/stream` — SSE статус/прогресс.
 - `POST /v1/workers/register|claim|complete|fail|heartbeat` — протокол worker.
+
+### Embeddings (sync, OpenAI-compatible)
+- `POST /v1/embeddings` — синхронный embedding proxy.
+
+Роутинг: модели с `/` в имени (например, `qwen/qwen3-embedding-8b`) маршрутизируются
+на облачный API (OpenRouter, OpenAI, etc.), остальные — на лучший доступный Ollama через
+SelectOllamaDevice с circuit breaker и retry.
+
+```bash
+# Локальный Ollama
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model": "nomic-embed-text", "input": "Hello world"}'
+
+# Облачный (OpenRouter)
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen/qwen3-embedding-8b", "input": "Hello world", "dimensions": 1024}'
+```
+
+Поддержка Matryoshka: параметр `dimensions` передаётся в cloud API для серверного truncation,
+с клиентским fallback через env `CLOUD_EMBED_DIMENSIONS`.
+
+### Discovery & Monitoring
 - `POST /v1/discovery/run` — ручной запуск discovery.
+- `GET /v1/dashboard` — текущее состояние устройств и моделей.
+- `GET /metrics` — Prometheus метрики (embedding requests, latency, devices online, discovery).
 
 ## 🔧 Ключевые переменные окружения
 
 - `PORT_DB_LLM=5435`, `PORT_HTTP_LLMCORE=8080`, `PORT_GRPC_LLMCORE=9090`, `PORT_MCP_LLM=3333`.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_EMBED_MODEL`.
-- `OPENAI_API_KEY`, `OPENROUTER_API_KEY`.
+- `OLLAMA_EXTRA_ENDPOINTS` — дополнительные Ollama endpoints через запятую (например, K8s сервисы).
+- `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` (по умолчанию `https://openrouter.ai/api/v1`).
+- `CLOUD_EMBED_DIMENSIONS` — fallback dimensions для Matryoshka truncation облачных моделей.
 - `TELEGRAM_USE_MCP`, `TELEGRAM_MCP_BASE_URL`, `TELEGRAM_MCP_BOT_ID`, `TELEGRAM_MCP_CHAT_ID`.
 - `TELEGRAM_MCP_FALLBACK_DIRECT=1` для отказоустойчивого маршрута телеметрии.
 - Если `TELEGRAM_MCP_BASE_URL` не задан, используется `http://tgapi:8000`; на 1 релиз включён legacy retry к `http://telegram-api:8000`.

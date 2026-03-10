@@ -286,7 +286,7 @@ func (rt *Router) SelectOllamaDevice(ctx context.Context, model string, task str
 	row := rt.DB.QueryRow(ctx, `
 		SELECT d.id,
 		       d.tags->>'ollama_addr' AS addr,
-		       d.tags->>'ollama_host' AS host,
+		       COALESCE(d.tags->>'ollama_host', '') AS host,
 		       (SELECT tps FROM benchmarks b
 		        WHERE b.device_id = d.id AND b.model_id = $1 AND b.task_type = $2
 		        ORDER BY created_at DESC LIMIT 1) AS tps,

@@ -1812,6 +1812,8 @@ func (s *Server) HandleDebugTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const embedTimeout = 120 * time.Second
+
 // HandleEmbeddings — synchronous OpenAI-compatible embedding proxy.
 // Routes embedding requests to the best available Ollama device via SelectOllamaDevice.
 // Supports retry with circuit breaker on device failure.
@@ -1826,6 +1828,7 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		Model          string `json:"model"`
 		Input          any    `json:"input"`
 		EncodingFormat string `json:"encoding_format,omitempty"`
+		Dimensions     int    `json:"dimensions,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
@@ -1856,10 +1859,42 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), embedTimeout)
 	defer cancel()
 
-	// Try up to 3 devices (circuit breaker will skip degraded ones)
+	// Cloud model (contains "/") → route to OpenRouter
+	if strings.Contains(req.Model, "/") {
+		apiKey := config.Getenv("OPENROUTER_API_KEY", "")
+		apiURL := config.Getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+		if apiKey == "" || apiKey == "not-used" {
+			WriteError(w, http.StatusServiceUnavailable, "no_api_key", "OPENROUTER_API_KEY not configured")
+			return
+		}
+		dims := req.Dimensions
+		if dims == 0 {
+			dims = config.GetenvInt("CLOUD_EMBED_DIMENSIONS", 0)
+		}
+		start := time.Now()
+		result, promptTokens, err := s.proxyOpenAIEmbed(ctx, apiURL, apiKey, req.Model, texts, dims)
+		elapsed := time.Since(start).Seconds()
+		if err != nil {
+			slog.Error("cloud embed fail", "model", req.Model, "error", err)
+			metrics.EmbeddingRequests.WithLabelValues(req.Model, "openrouter", "error").Inc()
+			WriteError(w, http.StatusBadGateway, "cloud_embed_failed", err.Error())
+			return
+		}
+		metrics.EmbeddingRequests.WithLabelValues(req.Model, "openrouter", "ok").Inc()
+		metrics.EmbeddingDuration.WithLabelValues(req.Model, "openrouter").Observe(elapsed)
+		metrics.EmbeddingInputTokens.WithLabelValues(req.Model, "openrouter").Add(float64(promptTokens))
+		// Client-side truncation as fallback if API didn't honor dimensions
+		if dims > 0 {
+			truncateEmbeddings(result, dims)
+		}
+		WriteJSON(w, http.StatusOK, result)
+		return
+	}
+
+	// Local model → route to Ollama device
 	const maxRetries = 3
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -1925,7 +1960,7 @@ func (s *Server) proxyOllamaEmbed(ctx context.Context, target *models.DeviceTarg
 		httpReq.Header.Set("Host", target.Host)
 	}
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: embedTimeout}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, 0, fmt.Errorf("ollama request failed: %w", err)
@@ -1976,4 +2011,67 @@ func (s *Server) proxyOllamaEmbed(ctx context.Context, target *models.DeviceTarg
 		},
 	}
 	return result, promptTokens, nil
+}
+
+// proxyOpenAIEmbed sends embedding request to an OpenAI-compatible API (OpenRouter, etc.)
+func (s *Server) proxyOpenAIEmbed(ctx context.Context, apiURL, apiKey, model string, texts []string, dims int) (map[string]any, int, error) {
+	reqBody := map[string]any{
+		"model": model,
+		"input": texts,
+	}
+	if dims > 0 {
+		reqBody["dimensions"] = dims
+	}
+	body, _ := json.Marshal(reqBody)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/embeddings", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: embedTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cloud embed request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, 0, fmt.Errorf("cloud embed returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, 0, fmt.Errorf("decode cloud embed response: %w", err)
+	}
+
+	promptTokens := 0
+	if usage, ok := result["usage"].(map[string]any); ok {
+		if pt, ok := usage["prompt_tokens"].(float64); ok {
+			promptTokens = int(pt)
+		}
+	}
+
+	return result, promptTokens, nil
+}
+
+// truncateEmbeddings truncates embedding vectors in OpenAI-format response to target dimensions (Matryoshka).
+func truncateEmbeddings(result map[string]any, dims int) {
+	dataSlice, ok := result["data"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range dataSlice {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		emb, ok := m["embedding"].([]any)
+		if ok && len(emb) > dims {
+			m["embedding"] = emb[:dims]
+		}
+	}
 }

@@ -155,6 +155,14 @@ async def llm_remember(text: str, user_id: str = "default") -> str:
     })
 
 
+# === Sync ===
+
+@mcp.tool()
+async def llm_sync_models() -> str:
+    """Синхронизировать каталог моделей из OpenRouter API (pricing, categories)."""
+    return await _post("/models/sync")
+
+
 log.info("LLM FastMCP server ready")
 
 if __name__ == "__main__":

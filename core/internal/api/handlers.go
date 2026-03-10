@@ -2104,18 +2104,57 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		MaxTokens   *int             `json:"max_tokens,omitempty"`
 		TopP        *float64         `json:"top_p,omitempty"`
 		Stop        any              `json:"stop,omitempty"`
+		TaskType    string           `json:"task_type,omitempty"`
+		Accuracy    string           `json:"accuracy,omitempty"`
+		MaxCostUSD  float64          `json:"max_cost_usd,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
 		return
 	}
-	if req.Model == "" {
-		WriteError(w, http.StatusBadRequest, "model_required", "Field 'model' is required")
-		return
-	}
 	if len(req.Messages) == 0 {
 		WriteError(w, http.StatusBadRequest, "messages_required", "Field 'messages' is required")
 		return
+	}
+
+	// Smart model selection: if model is empty, pick best from model_rankings
+	if req.Model == "" {
+		// Headers override body fields
+		taskType := r.Header.Get("X-Task-Type")
+		if taskType == "" {
+			taskType = req.TaskType
+		}
+		if taskType == "" {
+			taskType = "general"
+		}
+		accuracy := r.Header.Get("X-Accuracy")
+		if accuracy == "" {
+			accuracy = req.Accuracy
+		}
+		if accuracy == "" {
+			accuracy = "medium"
+		}
+		maxCost := req.MaxCostUSD
+		if mc := r.Header.Get("X-Max-Cost"); mc != "" {
+			if v, err := strconv.ParseFloat(mc, 64); err == nil {
+				maxCost = v
+			}
+		}
+
+		selected, err := s.selectModel(r.Context(), taskType, accuracy, maxCost, req.Messages)
+		if err != nil || selected == "" {
+			WriteError(w, http.StatusBadRequest, "no_model", "Could not select a model. Specify 'model' explicitly or seed model_rankings.")
+			return
+		}
+		req.Model = selected
+		w.Header().Set("X-Selected-Model", selected)
+		slog.Info("smart model selected", "model", selected, "task_type", taskType, "accuracy", accuracy)
+
+		// Re-serialize body with selected model
+		var bodyMap map[string]any
+		json.Unmarshal(bodyBytes, &bodyMap)
+		bodyMap["model"] = selected
+		bodyBytes, _ = json.Marshal(bodyMap)
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), chatTimeout)
@@ -2260,6 +2299,7 @@ func (s *Server) streamOpenAIChat(ctx context.Context, w http.ResponseWriter, ap
 		metrics.ChatTokens.WithLabelValues(model, "openrouter", "input").Add(float64(totalIn))
 		metrics.ChatTokens.WithLabelValues(model, "openrouter", "output").Add(float64(totalOut))
 		s.recordChatCost(model, "openrouter", totalIn, totalOut)
+		go s.updateModelStats(model, totalIn, totalOut, int(elapsed*1000), false)
 	}
 }
 
@@ -2272,6 +2312,9 @@ func (s *Server) proxyOllamaChat(ctx context.Context, w http.ResponseWriter, req
 	MaxTokens   *int             `json:"max_tokens,omitempty"`
 	TopP        *float64         `json:"top_p,omitempty"`
 	Stop        any              `json:"stop,omitempty"`
+	TaskType    string           `json:"task_type,omitempty"`
+	Accuracy    string           `json:"accuracy,omitempty"`
+	MaxCostUSD  float64          `json:"max_cost_usd,omitempty"`
 }, start time.Time) {
 	target := s.Router.SelectOllamaDevice(ctx, req.Model, "chat")
 	if target == nil {
@@ -2353,6 +2396,7 @@ func (s *Server) proxyOllamaChat(ctx context.Context, w http.ResponseWriter, req
 	if promptTokens > 0 || completionTokens > 0 {
 		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "input").Add(float64(promptTokens))
 		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "output").Add(float64(completionTokens))
+		go s.updateModelStats(req.Model, promptTokens, completionTokens, int(elapsed*1000), false)
 	}
 
 	// Convert to OpenAI format
@@ -2387,6 +2431,9 @@ func (s *Server) streamOllamaChat(ctx context.Context, w http.ResponseWriter, re
 	MaxTokens   *int             `json:"max_tokens,omitempty"`
 	TopP        *float64         `json:"top_p,omitempty"`
 	Stop        any              `json:"stop,omitempty"`
+	TaskType    string           `json:"task_type,omitempty"`
+	Accuracy    string           `json:"accuracy,omitempty"`
+	MaxCostUSD  float64          `json:"max_cost_usd,omitempty"`
 }, start time.Time) {
 	target := s.Router.SelectOllamaDevice(ctx, req.Model, "chat")
 	if target == nil {
@@ -2534,6 +2581,7 @@ func (s *Server) streamOllamaChat(ctx context.Context, w http.ResponseWriter, re
 	if totalIn > 0 || totalOut > 0 {
 		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "input").Add(float64(totalIn))
 		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "output").Add(float64(totalOut))
+		go s.updateModelStats(req.Model, totalIn, totalOut, int(elapsed*1000), false)
 	}
 }
 
@@ -2552,6 +2600,7 @@ func (s *Server) recordChatUsage(respBody []byte, model, provider string) {
 	metrics.ChatTokens.WithLabelValues(model, provider, "input").Add(float64(resp.Usage.PromptTokens))
 	metrics.ChatTokens.WithLabelValues(model, provider, "output").Add(float64(resp.Usage.CompletionTokens))
 	s.recordChatCost(model, provider, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	go s.updateModelStats(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, false)
 }
 
 // recordChatCost inserts cost record for a chat completion.
@@ -2575,6 +2624,11 @@ func (s *Server) recordChatCost(model, provider string, tokensIn, tokensOut int)
 	} else {
 		metrics.ChatCost.WithLabelValues(model, provider).Add(cost)
 		slog.Info("chat cost recorded", "model", model, "provider", provider, "tokens_in", tokensIn, "tokens_out", tokensOut, "cost", cost)
+		// Update model_stats cost
+		s.DB.Exec(ctx, `
+			UPDATE model_stats SET total_cost_usd = total_cost_usd + $2, updated_at = now()
+			WHERE model_id = $1
+		`, model, cost)
 	}
 }
 
@@ -2665,12 +2719,15 @@ func (s *Server) HandleCostsBalance(w http.ResponseWriter, r *http.Request) {
 				} `json:"data"`
 			}
 			if json.NewDecoder(resp.Body).Decode(&keyResp) == nil {
+				var balance float64
 				if keyResp.Data.LimitLeft != nil {
-					result["openrouter_balance_usd"] = *keyResp.Data.LimitLeft
+					balance = *keyResp.Data.LimitLeft
 				} else if keyResp.Data.Limit != nil {
-					result["openrouter_balance_usd"] = *keyResp.Data.Limit - keyResp.Data.Usage
+					balance = *keyResp.Data.Limit - keyResp.Data.Usage
 				}
+				result["openrouter_balance_usd"] = balance
 				result["openrouter_usage_usd"] = keyResp.Data.Usage
+				metrics.OpenRouterBalance.Set(balance)
 			}
 		}
 	}
@@ -2973,5 +3030,250 @@ func (s *Server) HandleModelStats(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, map[string]any{
 		"models": models,
 		"count":  len(models),
+	})
+}
+
+// ─── Smart Model Selection ──────────────────────────────────────────────────
+
+// selectModel picks the best model from model_rankings based on task type, accuracy, and cost.
+func (s *Server) selectModel(ctx context.Context, taskType, accuracy string, maxCost float64, messages []map[string]any) (string, error) {
+	// Estimate input tokens from messages
+	totalChars := 0
+	for _, m := range messages {
+		if c, ok := m["content"].(string); ok {
+			totalChars += len(c)
+		}
+	}
+	estimatedTokens := float64(totalChars) / 4.0
+
+	// Accuracy weights
+	var accWeight, costFactor float64
+	switch accuracy {
+	case "low":
+		accWeight, costFactor = 0.3, 3.0
+	case "high":
+		accWeight, costFactor = 0.9, 0.5
+	case "critical":
+		accWeight, costFactor = 1.0, 0.0
+	default: // medium
+		accWeight, costFactor = 0.6, 1.5
+	}
+
+	rows, err := s.DB.Query(ctx, `
+		SELECT model_id, category_scores, context_k, price_in_1m, price_out_1m
+		FROM model_rankings
+		WHERE provider = 'openrouter'
+		ORDER BY model_id
+	`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		modelID string
+		score   float64
+	}
+	var candidates []candidate
+
+	for rows.Next() {
+		var modelID string
+		var scoresRaw json.RawMessage
+		var contextK *int
+		var priceIn, priceOut float64
+
+		if err := rows.Scan(&modelID, &scoresRaw, &contextK, &priceIn, &priceOut); err != nil {
+			continue
+		}
+
+		// Check context fit
+		if contextK != nil && estimatedTokens > float64(*contextK)*1000 {
+			continue
+		}
+
+		// Estimate cost
+		estCost := (estimatedTokens/1_000_000)*priceIn + (estimatedTokens/1_000_000)*priceOut
+		if maxCost > 0 && estCost > maxCost {
+			continue
+		}
+
+		// Get category score
+		var scores map[string]float64
+		json.Unmarshal(scoresRaw, &scores)
+
+		catScore := scores[taskType]
+		if catScore == 0 {
+			// Fallback: average of all scores
+			total := 0.0
+			for _, v := range scores {
+				total += v
+			}
+			if len(scores) > 0 {
+				catScore = total / float64(len(scores))
+			} else {
+				catScore = 50
+			}
+		}
+
+		score := catScore*accWeight - costFactor*estCost
+
+		candidates = append(candidates, candidate{modelID: modelID, score: score})
+	}
+
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no suitable model found")
+	}
+
+	// Sort by score descending
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.score > best.score {
+			best = c
+		}
+	}
+
+	return best.modelID, nil
+}
+
+// updateModelStats increments model_stats counters after a chat completion.
+func (s *Server) updateModelStats(model string, tokensIn, tokensOut int, durationMs int, isError bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errInc := 0
+	if isError {
+		errInc = 1
+	}
+
+	_, err := s.DB.Exec(ctx, `
+		INSERT INTO model_stats (model_id, total_requests, total_tokens_in, total_tokens_out, avg_duration_ms, error_count, last_used_at)
+		VALUES ($1, 1, $2, $3, $4, $5, now())
+		ON CONFLICT (model_id) DO UPDATE SET
+			total_requests = model_stats.total_requests + 1,
+			total_tokens_in = model_stats.total_tokens_in + $2,
+			total_tokens_out = model_stats.total_tokens_out + $3,
+			avg_duration_ms = (model_stats.avg_duration_ms * model_stats.total_requests + $4) / (model_stats.total_requests + 1),
+			error_count = model_stats.error_count + $5,
+			last_used_at = now(),
+			updated_at = now()
+	`, model, tokensIn, tokensOut, durationMs, errInc)
+	if err != nil {
+		slog.Debug("model stats update skip", "model", model, "error", err)
+	}
+}
+
+// ─── OpenRouter Sync ────────────────────────────────────────────────────────
+
+// HandleOpenRouterSync fetches models from OpenRouter API and updates model_rankings.
+func (s *Server) HandleOpenRouterSync(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST allowed")
+		return
+	}
+
+	apiKey := config.Getenv("OPENROUTER_API_KEY", "")
+	if apiKey == "" || apiKey == "not-used" {
+		WriteError(w, http.StatusServiceUnavailable, "no_api_key", "OPENROUTER_API_KEY not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	categories := []string{"programming", "science", "technology", "translation", "finance", "academia"}
+	modelCategories := map[string][]string{} // model_id → [categories]
+
+	for _, cat := range categories {
+		url := fmt.Sprintf("https://openrouter.ai/api/v1/models?category=%s", cat)
+		httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			slog.Warn("openrouter sync fail", "category", cat, "error", err)
+			continue
+		}
+
+		var result struct {
+			Data []struct {
+				ID           string `json:"id"`
+				Name         string `json:"name"`
+				ContextLen   int    `json:"context_length"`
+				Pricing      struct {
+					Prompt     string `json:"prompt"`
+					Completion string `json:"completion"`
+				} `json:"pricing"`
+				Architecture struct {
+					Modality    string `json:"modality"`
+					InputMods   []string `json:"input_modalities"`
+				} `json:"architecture"`
+			} `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		for _, m := range result.Data {
+			modelCategories[m.ID] = append(modelCategories[m.ID], cat)
+
+			priceIn := 0.0
+			priceOut := 0.0
+			if v, err := strconv.ParseFloat(m.Pricing.Prompt, 64); err == nil {
+				priceIn = v * 1_000_000 // per-token → per-1M
+			}
+			if v, err := strconv.ParseFloat(m.Pricing.Completion, 64); err == nil {
+				priceOut = v * 1_000_000
+			}
+
+			contextK := m.ContextLen / 1000
+
+			// Upsert into model_rankings (don't overwrite manual category_scores)
+			_, err := s.DB.Exec(ctx, `
+				INSERT INTO model_rankings (model_id, provider, display_name, context_k, price_in_1m, price_out_1m)
+				VALUES ($1, 'openrouter', $2, $3, $4, $5)
+				ON CONFLICT (model_id) DO UPDATE SET
+					display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), model_rankings.display_name),
+					context_k = EXCLUDED.context_k,
+					price_in_1m = EXCLUDED.price_in_1m,
+					price_out_1m = EXCLUDED.price_out_1m,
+					updated_at = now()
+			`, m.ID, m.Name, contextK, priceIn, priceOut)
+			if err != nil {
+				slog.Debug("model upsert skip", "model", m.ID, "error", err)
+			}
+		}
+	}
+
+	// For models without manual category_scores, generate from category membership
+	for modelID, cats := range modelCategories {
+		scores := map[string]int{}
+		for _, c := range cats {
+			scores[c] = 75 // default score for category membership
+		}
+		scoresJSON, _ := json.Marshal(scores)
+
+		// Only update if category_scores is empty
+		s.DB.Exec(ctx, `
+			UPDATE model_rankings
+			SET category_scores = $2
+			WHERE model_id = $1 AND (category_scores IS NULL OR category_scores = '{}'::jsonb)
+		`, modelID, string(scoresJSON))
+	}
+
+	// Ensure model_stats entries exist
+	s.DB.Exec(ctx, `
+		INSERT INTO model_stats (model_id)
+		SELECT model_id FROM model_rankings
+		ON CONFLICT DO NOTHING
+	`)
+
+	totalModels := len(modelCategories)
+	slog.Info("openrouter sync complete", "models_synced", totalModels, "categories", len(categories))
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"synced":   totalModels,
+		"categories": categories,
 	})
 }

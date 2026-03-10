@@ -105,4 +105,12 @@ var (
 		},
 		[]string{"model", "provider"},
 	)
+
+	// OpenRouterBalance tracks current OpenRouter account balance.
+	OpenRouterBalance = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "llmcore_openrouter_balance_usd",
+			Help: "OpenRouter account balance in USD",
+		},
+	)
 )

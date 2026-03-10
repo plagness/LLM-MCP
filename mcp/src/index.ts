@@ -219,6 +219,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Проксирование: sync моделей OpenRouter
+  if (req.url === "/models/sync" && req.method === "POST") {
+    proxyToCore(`${coreHttp}/v1/models/sync`, "POST", null, res);
+    return;
+  }
+
   sendJson(res, 404, { error: "not_found" });
 });
 

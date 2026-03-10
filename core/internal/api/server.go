@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"llm-mcp/core/internal/discovery"
 	"llm-mcp/core/internal/routing"
@@ -50,4 +51,6 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/debug/actions", s.HandleDebugActions)
 	mux.HandleFunc("/v1/debug/capacity", s.HandleDebugCapacity)
 	mux.HandleFunc("/v1/debug/test", s.HandleDebugTest)
+	mux.HandleFunc("/v1/embeddings", s.HandleEmbeddings)
+	mux.Handle("/metrics", promhttp.Handler())
 }

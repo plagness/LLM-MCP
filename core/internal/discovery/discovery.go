@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"llm-mcp/core/internal/metrics"
 )
 
 type Runner struct {
@@ -134,6 +136,18 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.clearLanDevices(ctx)
 	}
 
+	// Probe explicit extra endpoints (K8s services, Docker containers, etc.)
+	if extra := os.Getenv("OLLAMA_EXTRA_ENDPOINTS"); extra != "" {
+		for _, ep := range strings.Split(extra, ",") {
+			ep = strings.TrimSpace(ep)
+			if ep == "" {
+				continue
+			}
+			r.probeExtraEndpoint(ctx, ep)
+			count++
+		}
+	}
+
 	// Обработка offline устройств (только если Tailscale доступен)
 	offlineIDs := []string{}
 	if hasTailscale && status.Self.HostName != "" {
@@ -146,7 +160,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	r.setLastRun(time.Now())
-	slog.Info("discovery done", "component", "discovery", "peers", count, "offline", len(offlineIDs), "tailscale", hasTailscale, "elapsed", time.Since(start).String())
+	elapsed := time.Since(start)
+	metrics.DiscoveryDuration.Observe(elapsed.Seconds())
+	metrics.DiscoveryRuns.WithLabelValues("ok").Inc()
+
+	// Update devices online gauge
+	var onlineCount float64
+	_ = r.DB.QueryRow(ctx, `SELECT COUNT(*) FROM devices WHERE status = 'online' AND COALESCE(tags->>'ollama','false') = 'true'`).Scan(&onlineCount)
+	metrics.DevicesOnline.Set(onlineCount)
+
+	slog.Info("discovery done", "component", "discovery", "peers", count, "offline", len(offlineIDs), "tailscale", hasTailscale, "elapsed", elapsed.String())
 	return nil
 }
 
@@ -358,6 +381,47 @@ func (r *Runner) probeOllamaPort(ctx context.Context, deviceID string, addrs []s
 		return
 	}
 	slog.Info("ollama ok", "component", "discovery", "device_id", deviceID, "addr", ollamaAddr, "port", portStr, "host", bestHost, "latency_ms", bestLatency, "models", len(bestModels))
+}
+
+// probeExtraEndpoint probes an explicit Ollama endpoint (host:port format).
+// Used for K8s service endpoints that aren't discoverable via Tailscale.
+func (r *Runner) probeExtraEndpoint(ctx context.Context, endpoint string) {
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		// No port specified, default to 11434
+		host = endpoint
+		portStr = "11434"
+	}
+	port, _ := strconv.Atoi(portStr)
+	if port == 0 {
+		port = 11434
+		portStr = "11434"
+	}
+
+	// Use endpoint as device ID (e.g., "ollama-fi.ns-agents.svc")
+	deviceID := "extra:" + host
+	if port != 11434 {
+		deviceID = "extra:" + host + ":" + portStr
+	}
+
+	// Ensure device record exists
+	_, err = r.DB.Exec(ctx, `
+		INSERT INTO devices (id, name, platform, arch, host, tags, status, last_seen, updated_at)
+		VALUES ($1, $2, 'linux', 'unknown', $3,
+		        jsonb_build_object('extra_endpoint', true, 'source', 'OLLAMA_EXTRA_ENDPOINTS'),
+		        'online', now(), now())
+		ON CONFLICT (id) DO UPDATE SET
+		  status = 'online',
+		  last_seen = now(),
+		  updated_at = now()
+	`, deviceID, host, host)
+	if err != nil {
+		slog.Error("extra endpoint upsert error", "component", "discovery", "endpoint", endpoint, "error", err)
+		return
+	}
+
+	// Probe Ollama on this endpoint
+	r.probeOllamaPort(ctx, deviceID, []string{host}, nil, port)
 }
 
 func formatAddr(addr string) string {

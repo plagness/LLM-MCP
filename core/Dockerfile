@@ -1,9 +1,9 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download || true
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/llm-core ./cmd/core
+RUN go mod tidy && CGO_ENABLED=0 go build -o /out/llm-core ./cmd/core
 
 FROM alpine:3.20
 WORKDIR /app

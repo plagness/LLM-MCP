@@ -15,8 +15,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"io"
+
 	"llm-mcp/core/internal/config"
 	"llm-mcp/core/internal/limits"
+	"llm-mcp/core/internal/metrics"
 	"llm-mcp/core/internal/models"
 	"llm-mcp/core/internal/routing"
 )
@@ -1552,6 +1555,8 @@ func (s *Server) HandleDebugActions(w http.ResponseWriter, r *http.Request) {
 		{"GET", "/v1/debug/actions", "Этот эндпоинт: каталог всех API actions", "curl http://localhost:8080/v1/debug/actions | jq '.endpoints[].path'"},
 		{"GET", "/v1/debug/capacity", "Мощности кластера: слоты, загрузка, утилизация по хостам", "curl http://localhost:8080/v1/debug/capacity | jq ."},
 		{"POST", "/v1/debug/test", "Smoke test: проверяет БД, Ollama, job pipeline", "curl -X POST http://localhost:8080/v1/debug/test | jq .results"},
+		{"POST", "/v1/embeddings", "Synchronous OpenAI-compatible embedding proxy (routes to best Ollama device)", "curl -X POST http://localhost:8080/v1/embeddings -d '{\"model\":\"qwen3-embedding:0.6b\",\"input\":\"Hello world\"}'"},
+		{"GET", "/metrics", "Prometheus metrics endpoint", "curl http://localhost:8080/metrics"},
 	}
 
 	WriteJSON(w, http.StatusOK, map[string]any{
@@ -1805,4 +1810,170 @@ func (s *Server) HandleDebugTest(w http.ResponseWriter, r *http.Request) {
 		"results":     results,
 		"issues":      issues,
 	})
+}
+
+// HandleEmbeddings — synchronous OpenAI-compatible embedding proxy.
+// Routes embedding requests to the best available Ollama device via SelectOllamaDevice.
+// Supports retry with circuit breaker on device failure.
+func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST allowed")
+		return
+	}
+
+	var req struct {
+		Model          string `json:"model"`
+		Input          any    `json:"input"`
+		EncodingFormat string `json:"encoding_format,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+	if req.Model == "" {
+		WriteError(w, http.StatusBadRequest, "model_required", "Field 'model' is required")
+		return
+	}
+
+	// Normalize input to []string
+	var texts []string
+	switch v := req.Input.(type) {
+	case string:
+		texts = []string{v}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				texts = append(texts, s)
+			}
+		}
+	default:
+		WriteError(w, http.StatusBadRequest, "invalid_input", "Field 'input' must be a string or array of strings")
+		return
+	}
+	if len(texts) == 0 {
+		WriteError(w, http.StatusBadRequest, "empty_input", "Input is empty")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	// Try up to 3 devices (circuit breaker will skip degraded ones)
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		target := s.Router.SelectOllamaDevice(ctx, req.Model, "embed")
+		if target == nil {
+			if attempt == 0 {
+				metrics.EmbeddingRequests.WithLabelValues(req.Model, "none", "no_device").Inc()
+				WriteError(w, http.StatusServiceUnavailable, "no_device", "No online device has model '"+req.Model+"'")
+				return
+			}
+			break // no more devices to try
+		}
+
+		start := time.Now()
+		result, promptTokens, err := s.proxyOllamaEmbed(ctx, target, req.Model, texts)
+		elapsed := time.Since(start).Seconds()
+
+		if err != nil {
+			slog.Warn("embed proxy fail", "device", target.ID, "model", req.Model, "attempt", attempt+1, "error", err)
+			s.Router.RecordDeviceResult(target.ID, false)
+			lastErr = err
+			continue
+		}
+
+		s.Router.RecordDeviceResult(target.ID, true)
+		metrics.EmbeddingRequests.WithLabelValues(req.Model, target.ID, "ok").Inc()
+		metrics.EmbeddingDuration.WithLabelValues(req.Model, target.ID).Observe(elapsed)
+		metrics.EmbeddingInputTokens.WithLabelValues(req.Model, target.ID).Add(float64(promptTokens))
+
+		// Return OpenAI-compatible response
+		WriteJSON(w, http.StatusOK, result)
+		return
+	}
+
+	metrics.EmbeddingRequests.WithLabelValues(req.Model, "all", "error").Inc()
+	errMsg := "All devices failed"
+	if lastErr != nil {
+		errMsg = lastErr.Error()
+	}
+	WriteError(w, http.StatusBadGateway, "embed_failed", errMsg)
+}
+
+// proxyOllamaEmbed sends embedding request to an Ollama device and returns OpenAI-format response.
+func (s *Server) proxyOllamaEmbed(ctx context.Context, target *models.DeviceTarget, model string, texts []string) (map[string]any, int, error) {
+	addr := target.Addr
+	if !strings.Contains(addr, "://") {
+		addr = "http://" + addr
+	}
+
+	// Ollama /api/embed supports batch input
+	ollamaReq := map[string]any{
+		"model": model,
+		"input": texts,
+	}
+	body, _ := json.Marshal(ollamaReq)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/api/embed", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if target.Host != "" {
+		httpReq.Header.Set("Host", target.Host)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ollama request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, 0, fmt.Errorf("ollama returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var ollamaResp struct {
+		Model      string      `json:"model"`
+		Embeddings [][]float64 `json:"embeddings"`
+		PromptEval int         `json:"prompt_eval_count"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
+		return nil, 0, fmt.Errorf("decode ollama response: %w", err)
+	}
+
+	// Transform to OpenAI format
+	data := make([]map[string]any, len(ollamaResp.Embeddings))
+	for i, emb := range ollamaResp.Embeddings {
+		data[i] = map[string]any{
+			"object":    "embedding",
+			"embedding": emb,
+			"index":     i,
+		}
+	}
+
+	promptTokens := ollamaResp.PromptEval
+	if promptTokens == 0 {
+		// Estimate: ~4 chars per token
+		total := 0
+		for _, t := range texts {
+			total += len(t)
+		}
+		promptTokens = total / 4
+	}
+
+	result := map[string]any{
+		"object": "list",
+		"data":   data,
+		"model":  ollamaResp.Model,
+		"usage": map[string]int{
+			"prompt_tokens": promptTokens,
+			"total_tokens":  promptTokens,
+		},
+	}
+	return result, promptTokens, nil
 }

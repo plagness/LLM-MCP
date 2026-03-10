@@ -117,10 +117,39 @@ curl -X POST http://localhost:8080/v1/embeddings \
 Поддержка Matryoshka: параметр `dimensions` передаётся в cloud API для серверного truncation,
 с клиентским fallback через env `CLOUD_EMBED_DIMENSIONS`.
 
+### Chat Completions (sync + streaming, OpenAI-compatible)
+- `POST /v1/chat/completions` — синхронный/streaming chat completion proxy.
+
+Роутинг аналогичен embeddings: модели с `/` → OpenRouter, без `/` → Ollama.
+Поддержка `stream: true` (SSE). Ollama NDJSON автоматически конвертируется в OpenAI SSE формат.
+
+```bash
+# Sync
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "google/gemini-2.5-flash-lite", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Streaming
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "google/gemini-2.5-flash-lite", "messages": [{"role": "user", "content": "Count 1-5"}], "stream": true}'
+```
+
+### Cost & Analytics
+- `GET /v1/costs/balance` — баланс OpenRouter, расходы за день/неделю/месяц, top модели.
+- `GET /v1/costs/summary` — детальная сводка расходов.
+- `GET /v1/models/stats` — статистика по моделям (запросы, токены, расходы, feedback).
+- `POST /v1/feedback` — оценка качества ответа (`{"model": "...", "rating": "good|bad"}`).
+
+### Knowledge Ingestion
+- `POST /v1/knowledge/ingest` — запись знаний в LightRAG или mem0.
+  - `target: "lightrag"` — глубокие знания (entity extraction, граф). Минимум 100 символов.
+  - `target: "mem0"` — короткие факты/предпочтения. Минимум 10 символов.
+
 ### Discovery & Monitoring
 - `POST /v1/discovery/run` — ручной запуск discovery.
 - `GET /v1/dashboard` — текущее состояние устройств и моделей.
-- `GET /metrics` — Prometheus метрики (embedding requests, latency, devices online, discovery).
+- `GET /metrics` — Prometheus метрики (embedding/chat requests, latency, tokens, cost, devices).
 
 ## 🔧 Ключевые переменные окружения
 

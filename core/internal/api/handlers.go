@@ -2075,3 +2075,903 @@ func truncateEmbeddings(result map[string]any, dims int) {
 		}
 	}
 }
+
+// ─── Chat Completions Proxy ─────────────────────────────────────────────────
+
+const chatTimeout = 120 * time.Second
+
+// HandleChatCompletions — synchronous OpenAI-compatible chat completion proxy.
+// Routes: model with "/" → cloud (OpenRouter); model without "/" → Ollama.
+// Supports streaming (SSE) via stream=true.
+func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST allowed")
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10<<20)) // 10MB limit
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "read_error", "Failed to read request body")
+		return
+	}
+
+	var req struct {
+		Model       string           `json:"model"`
+		Messages    []map[string]any `json:"messages"`
+		Stream      bool             `json:"stream"`
+		Temperature *float64         `json:"temperature,omitempty"`
+		MaxTokens   *int             `json:"max_tokens,omitempty"`
+		TopP        *float64         `json:"top_p,omitempty"`
+		Stop        any              `json:"stop,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+	if req.Model == "" {
+		WriteError(w, http.StatusBadRequest, "model_required", "Field 'model' is required")
+		return
+	}
+	if len(req.Messages) == 0 {
+		WriteError(w, http.StatusBadRequest, "messages_required", "Field 'messages' is required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), chatTimeout)
+	defer cancel()
+
+	start := time.Now()
+
+	// Cloud model (contains "/") → route to OpenRouter
+	if strings.Contains(req.Model, "/") {
+		apiKey := config.Getenv("OPENROUTER_API_KEY", "")
+		apiURL := config.Getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+		if apiKey == "" || apiKey == "not-used" {
+			WriteError(w, http.StatusServiceUnavailable, "no_api_key", "OPENROUTER_API_KEY not configured")
+			return
+		}
+
+		if req.Stream {
+			s.streamOpenAIChat(ctx, w, apiURL, apiKey, bodyBytes, req.Model, start)
+		} else {
+			s.proxyOpenAIChat(ctx, w, apiURL, apiKey, bodyBytes, req.Model, start)
+		}
+		return
+	}
+
+	// Local model → route to Ollama device
+	if req.Stream {
+		s.streamOllamaChat(ctx, w, req, start)
+	} else {
+		s.proxyOllamaChat(ctx, w, req, start)
+	}
+}
+
+// proxyOpenAIChat forwards a chat completion request to OpenRouter (sync).
+func (s *Server) proxyOpenAIChat(ctx context.Context, w http.ResponseWriter, apiURL, apiKey string, body []byte, model string, start time.Time) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/chat/completions", strings.NewReader(string(body)))
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		WriteError(w, http.StatusInternalServerError, "request_error", err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: chatTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		WriteError(w, http.StatusBadGateway, "cloud_chat_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		slog.Error("cloud chat fail", "model", model, "status", resp.StatusCode, "body", string(respBody[:min(len(respBody), 512)]))
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	elapsed := time.Since(start).Seconds()
+	metrics.ChatRequests.WithLabelValues(model, "openrouter", "ok").Inc()
+	metrics.ChatDuration.WithLabelValues(model, "openrouter").Observe(elapsed)
+
+	// Extract usage for metrics and cost recording
+	s.recordChatUsage(respBody, model, "openrouter")
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(respBody)
+}
+
+// streamOpenAIChat streams SSE from OpenRouter to client (pass-through).
+func (s *Server) streamOpenAIChat(ctx context.Context, w http.ResponseWriter, apiURL, apiKey string, body []byte, model string, start time.Time) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/chat/completions", strings.NewReader(string(body)))
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		WriteError(w, http.StatusInternalServerError, "request_error", err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: chatTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		WriteError(w, http.StatusBadGateway, "cloud_chat_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		metrics.ChatRequests.WithLabelValues(model, "openrouter", "error").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	metrics.ChatRequests.WithLabelValues(model, "openrouter", "ok").Inc()
+
+	// SSE pass-through
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(200)
+
+	flusher, _ := w.(http.Flusher)
+
+	scanner := newSSEScanner(resp.Body)
+	var totalIn, totalOut int
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Fprintf(w, "%s\n", line)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		// Try to extract usage from final chunk
+		if strings.HasPrefix(line, "data: ") && line != "data: [DONE]" {
+			data := line[6:]
+			var chunk struct {
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal([]byte(data), &chunk) == nil && chunk.Usage != nil {
+				totalIn = chunk.Usage.PromptTokens
+				totalOut = chunk.Usage.CompletionTokens
+			}
+		}
+	}
+
+	elapsed := time.Since(start).Seconds()
+	metrics.ChatDuration.WithLabelValues(model, "openrouter").Observe(elapsed)
+	if totalIn > 0 || totalOut > 0 {
+		metrics.ChatTokens.WithLabelValues(model, "openrouter", "input").Add(float64(totalIn))
+		metrics.ChatTokens.WithLabelValues(model, "openrouter", "output").Add(float64(totalOut))
+		s.recordChatCost(model, "openrouter", totalIn, totalOut)
+	}
+}
+
+// proxyOllamaChat sends chat request to Ollama and converts response to OpenAI format (sync).
+func (s *Server) proxyOllamaChat(ctx context.Context, w http.ResponseWriter, req struct {
+	Model       string           `json:"model"`
+	Messages    []map[string]any `json:"messages"`
+	Stream      bool             `json:"stream"`
+	Temperature *float64         `json:"temperature,omitempty"`
+	MaxTokens   *int             `json:"max_tokens,omitempty"`
+	TopP        *float64         `json:"top_p,omitempty"`
+	Stop        any              `json:"stop,omitempty"`
+}, start time.Time) {
+	target := s.Router.SelectOllamaDevice(ctx, req.Model, "chat")
+	if target == nil {
+		metrics.ChatRequests.WithLabelValues(req.Model, "none", "no_device").Inc()
+		WriteError(w, http.StatusServiceUnavailable, "no_device", "No online device has model '"+req.Model+"'")
+		return
+	}
+
+	addr := target.Addr
+	if !strings.Contains(addr, "://") {
+		addr = "http://" + addr
+	}
+
+	// Build Ollama /api/chat request
+	ollamaReq := map[string]any{
+		"model":    req.Model,
+		"messages": req.Messages,
+		"stream":   false,
+	}
+	if req.Temperature != nil {
+		ollamaReq["options"] = map[string]any{"temperature": *req.Temperature}
+	}
+
+	body, _ := json.Marshal(ollamaReq)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/api/chat", strings.NewReader(string(body)))
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusInternalServerError, "request_error", err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if target.Host != "" {
+		httpReq.Header.Set("Host", target.Host)
+	}
+
+	client := &http.Client{Timeout: chatTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		s.Router.RecordDeviceResult(target.ID, false)
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusBadGateway, "ollama_chat_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		s.Router.RecordDeviceResult(target.ID, false)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusBadGateway, "ollama_chat_failed", fmt.Sprintf("ollama returned %d: %s", resp.StatusCode, string(respBody)))
+		return
+	}
+
+	var ollamaResp struct {
+		Model   string         `json:"model"`
+		Message map[string]any `json:"message"`
+		Done    bool           `json:"done"`
+		Metrics struct {
+			PromptEvalCount int `json:"prompt_eval_count"`
+			EvalCount       int `json:"eval_count"`
+		} `json:"metrics"`
+		PromptEvalCount int `json:"prompt_eval_count"`
+		EvalCount       int `json:"eval_count"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusBadGateway, "decode_error", err.Error())
+		return
+	}
+
+	s.Router.RecordDeviceResult(target.ID, true)
+	elapsed := time.Since(start).Seconds()
+	metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "ok").Inc()
+	metrics.ChatDuration.WithLabelValues(req.Model, target.ID).Observe(elapsed)
+
+	promptTokens := ollamaResp.PromptEvalCount
+	completionTokens := ollamaResp.EvalCount
+
+	if promptTokens > 0 || completionTokens > 0 {
+		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "input").Add(float64(promptTokens))
+		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "output").Add(float64(completionTokens))
+	}
+
+	// Convert to OpenAI format
+	openAIResp := map[string]any{
+		"id":      "chatcmpl-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   ollamaResp.Model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"message":       ollamaResp.Message,
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]int{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+		},
+	}
+
+	WriteJSON(w, http.StatusOK, openAIResp)
+}
+
+// streamOllamaChat streams Ollama NDJSON → OpenAI SSE format.
+func (s *Server) streamOllamaChat(ctx context.Context, w http.ResponseWriter, req struct {
+	Model       string           `json:"model"`
+	Messages    []map[string]any `json:"messages"`
+	Stream      bool             `json:"stream"`
+	Temperature *float64         `json:"temperature,omitempty"`
+	MaxTokens   *int             `json:"max_tokens,omitempty"`
+	TopP        *float64         `json:"top_p,omitempty"`
+	Stop        any              `json:"stop,omitempty"`
+}, start time.Time) {
+	target := s.Router.SelectOllamaDevice(ctx, req.Model, "chat")
+	if target == nil {
+		metrics.ChatRequests.WithLabelValues(req.Model, "none", "no_device").Inc()
+		WriteError(w, http.StatusServiceUnavailable, "no_device", "No online device has model '"+req.Model+"'")
+		return
+	}
+
+	addr := target.Addr
+	if !strings.Contains(addr, "://") {
+		addr = "http://" + addr
+	}
+
+	ollamaReq := map[string]any{
+		"model":    req.Model,
+		"messages": req.Messages,
+		"stream":   true,
+	}
+	if req.Temperature != nil {
+		ollamaReq["options"] = map[string]any{"temperature": *req.Temperature}
+	}
+
+	body, _ := json.Marshal(ollamaReq)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/api/chat", strings.NewReader(string(body)))
+	if err != nil {
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusInternalServerError, "request_error", err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if target.Host != "" {
+		httpReq.Header.Set("Host", target.Host)
+	}
+
+	client := &http.Client{Timeout: chatTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		s.Router.RecordDeviceResult(target.ID, false)
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusBadGateway, "ollama_chat_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		s.Router.RecordDeviceResult(target.ID, false)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "error").Inc()
+		WriteError(w, http.StatusBadGateway, "ollama_chat_failed", fmt.Sprintf("ollama returned %d: %s", resp.StatusCode, string(respBody)))
+		return
+	}
+
+	s.Router.RecordDeviceResult(target.ID, true)
+	metrics.ChatRequests.WithLabelValues(req.Model, target.ID, "ok").Inc()
+
+	// Stream: Ollama NDJSON → OpenAI SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(200)
+
+	flusher, _ := w.(http.Flusher)
+	chatID := "chatcmpl-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+
+	scanner := newSSEScanner(resp.Body)
+	var totalIn, totalOut int
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var chunk struct {
+			Model           string         `json:"model"`
+			Message         map[string]any `json:"message"`
+			Done            bool           `json:"done"`
+			PromptEvalCount int            `json:"prompt_eval_count"`
+			EvalCount       int            `json:"eval_count"`
+		}
+		if json.Unmarshal([]byte(line), &chunk) != nil {
+			continue
+		}
+
+		if chunk.Done {
+			totalIn = chunk.PromptEvalCount
+			totalOut = chunk.EvalCount
+
+			// Send final chunk with finish_reason
+			sseChunk := map[string]any{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   chunk.Model,
+				"choices": []map[string]any{
+					{
+						"index":         0,
+						"delta":         map[string]any{},
+						"finish_reason": "stop",
+					},
+				},
+			}
+			data, _ := json.Marshal(sseChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			break
+		}
+
+		// Convert Ollama chunk to OpenAI SSE chunk
+		content := ""
+		if msg, ok := chunk.Message["content"].(string); ok {
+			content = msg
+		}
+
+		sseChunk := map[string]any{
+			"id":      chatID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   chunk.Model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"content": content,
+					},
+				},
+			},
+		}
+		data, _ := json.Marshal(sseChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	elapsed := time.Since(start).Seconds()
+	metrics.ChatDuration.WithLabelValues(req.Model, target.ID).Observe(elapsed)
+	if totalIn > 0 || totalOut > 0 {
+		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "input").Add(float64(totalIn))
+		metrics.ChatTokens.WithLabelValues(req.Model, target.ID, "output").Add(float64(totalOut))
+	}
+}
+
+// recordChatUsage extracts usage from OpenAI-format response and records metrics.
+func (s *Server) recordChatUsage(respBody []byte, model, provider string) {
+	var resp struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(respBody, &resp) != nil || resp.Usage == nil {
+		return
+	}
+
+	metrics.ChatTokens.WithLabelValues(model, provider, "input").Add(float64(resp.Usage.PromptTokens))
+	metrics.ChatTokens.WithLabelValues(model, provider, "output").Add(float64(resp.Usage.CompletionTokens))
+	s.recordChatCost(model, provider, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+}
+
+// recordChatCost inserts cost record for a chat completion.
+func (s *Server) recordChatCost(model, provider string, tokensIn, tokensOut int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var cost float64
+	row := s.DB.QueryRow(ctx, `SELECT calculate_job_cost($1, $2, $3)`, model, tokensIn, tokensOut)
+	if err := row.Scan(&cost); err != nil {
+		slog.Debug("chat cost calc skip", "model", model, "error", err)
+		return
+	}
+
+	_, err := s.DB.Exec(ctx, `
+		INSERT INTO llm_costs (id, job_id, model_id, provider, tokens_in, tokens_out, cost_usd)
+		VALUES (gen_random_uuid(), NULL, $1, $2, $3, $4, $5)
+	`, model, provider, tokensIn, tokensOut, cost)
+	if err != nil {
+		slog.Error("chat cost insert error", "model", model, "error", err)
+	} else {
+		metrics.ChatCost.WithLabelValues(model, provider).Add(cost)
+		slog.Info("chat cost recorded", "model", model, "provider", provider, "tokens_in", tokensIn, "tokens_out", tokensOut, "cost", cost)
+	}
+}
+
+// newSSEScanner creates a line scanner suitable for SSE/NDJSON streams.
+func newSSEScanner(r io.Reader) *lineScanner {
+	return &lineScanner{r: r, buf: make([]byte, 0, 4096)}
+}
+
+type lineScanner struct {
+	r    io.Reader
+	buf  []byte
+	line string
+	err  error
+}
+
+func (s *lineScanner) Scan() bool {
+	for {
+		if idx := indexOf(s.buf, '\n'); idx >= 0 {
+			s.line = string(s.buf[:idx])
+			s.buf = s.buf[idx+1:]
+			// Trim \r for \r\n lines
+			s.line = strings.TrimRight(s.line, "\r")
+			return true
+		}
+		tmp := make([]byte, 4096)
+		n, err := s.r.Read(tmp)
+		if n > 0 {
+			s.buf = append(s.buf, tmp[:n]...)
+		}
+		if err != nil {
+			s.err = err
+			if len(s.buf) > 0 {
+				s.line = string(s.buf)
+				s.buf = s.buf[:0]
+				return true
+			}
+			return false
+		}
+	}
+}
+
+func (s *lineScanner) Text() string { return s.line }
+
+func indexOf(b []byte, c byte) int {
+	for i, v := range b {
+		if v == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// ─── Balance Endpoint ───────────────────────────────────────────────────────
+
+// HandleCostsBalance returns OpenRouter balance and spend summary.
+func (s *Server) HandleCostsBalance(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodGet {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET allowed")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	result := map[string]any{
+		"openrouter_balance_usd": nil,
+		"spend_today_usd":       0,
+		"spend_week_usd":        0,
+		"spend_month_usd":       0,
+		"top_models":            []any{},
+	}
+
+	// Get OpenRouter balance
+	apiKey := config.Getenv("OPENROUTER_API_KEY", "")
+	if apiKey != "" && apiKey != "not-used" {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://openrouter.ai/api/v1/auth/key", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			var keyResp struct {
+				Data struct {
+					Limit      *float64 `json:"limit"`
+					Usage      float64  `json:"usage"`
+					LimitLeft  *float64 `json:"limit_remaining"`
+				} `json:"data"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&keyResp) == nil {
+				if keyResp.Data.LimitLeft != nil {
+					result["openrouter_balance_usd"] = *keyResp.Data.LimitLeft
+				} else if keyResp.Data.Limit != nil {
+					result["openrouter_balance_usd"] = *keyResp.Data.Limit - keyResp.Data.Usage
+				}
+				result["openrouter_usage_usd"] = keyResp.Data.Usage
+			}
+		}
+	}
+
+	// Get spend from llm_costs
+	var spendToday, spendWeek, spendMonth float64
+	s.DB.QueryRow(ctx, `SELECT COALESCE(SUM(cost_usd), 0) FROM llm_costs WHERE created_at > now() - interval '1 day'`).Scan(&spendToday)
+	s.DB.QueryRow(ctx, `SELECT COALESCE(SUM(cost_usd), 0) FROM llm_costs WHERE created_at > now() - interval '7 days'`).Scan(&spendWeek)
+	s.DB.QueryRow(ctx, `SELECT COALESCE(SUM(cost_usd), 0) FROM llm_costs WHERE created_at > now() - interval '30 days'`).Scan(&spendMonth)
+	result["spend_today_usd"] = spendToday
+	result["spend_week_usd"] = spendWeek
+	result["spend_month_usd"] = spendMonth
+
+	// Top models by spend
+	rows, err := s.DB.Query(ctx, `
+		SELECT model_id, COUNT(*) as requests, SUM(tokens_in) as tokens_in, SUM(tokens_out) as tokens_out, SUM(cost_usd) as cost
+		FROM llm_costs
+		WHERE created_at > now() - interval '30 days'
+		GROUP BY model_id
+		ORDER BY cost DESC
+		LIMIT 10
+	`)
+	if err == nil {
+		defer rows.Close()
+		var topModels []map[string]any
+		for rows.Next() {
+			var modelID string
+			var requests int
+			var tokensIn, tokensOut int64
+			var cost float64
+			if rows.Scan(&modelID, &requests, &tokensIn, &tokensOut, &cost) == nil {
+				topModels = append(topModels, map[string]any{
+					"model":     modelID,
+					"requests":  requests,
+					"tokens_in": tokensIn,
+					"tokens_out": tokensOut,
+					"cost_usd":  cost,
+				})
+			}
+		}
+		result["top_models"] = topModels
+	}
+
+	WriteJSON(w, http.StatusOK, result)
+}
+
+// ─── Feedback Endpoint ──────────────────────────────────────────────────────
+
+// HandleFeedback records user feedback on LLM response quality.
+func (s *Server) HandleFeedback(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST allowed")
+		return
+	}
+
+	var req struct {
+		Model   string `json:"model"`
+		Rating  string `json:"rating"`
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+	if req.Model == "" {
+		WriteError(w, http.StatusBadRequest, "model_required", "Field 'model' is required")
+		return
+	}
+	if req.Rating != "good" && req.Rating != "bad" {
+		WriteError(w, http.StatusBadRequest, "invalid_rating", "Rating must be 'good' or 'bad'")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	col := "feedback_positive"
+	if req.Rating == "bad" {
+		col = "feedback_negative"
+	}
+
+	_, err := s.DB.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO model_stats (model_id, %s) VALUES ($1, 1)
+		ON CONFLICT (model_id) DO UPDATE SET %s = model_stats.%s + 1, updated_at = now()
+	`, col, col, col), req.Model)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "model": req.Model, "rating": req.Rating})
+}
+
+// ─── Knowledge Ingestion Endpoint ───────────────────────────────────────────
+
+// HandleKnowledgeIngest proxies knowledge to LightRAG or mem0.
+func (s *Server) HandleKnowledgeIngest(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST allowed")
+		return
+	}
+
+	var req struct {
+		Text     string            `json:"text"`
+		Target   string            `json:"target"`
+		Metadata map[string]string `json:"metadata"`
+		UserID   string            `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+
+	if req.Target == "" {
+		req.Target = "lightrag"
+	}
+
+	switch req.Target {
+	case "lightrag":
+		if len(req.Text) < 100 {
+			WriteError(w, http.StatusBadRequest, "text_too_short", "Text must be at least 100 characters for LightRAG")
+			return
+		}
+		s.ingestLightRAG(w, r.Context(), req.Text, req.Metadata)
+
+	case "mem0":
+		if len(req.Text) < 10 {
+			WriteError(w, http.StatusBadRequest, "text_too_short", "Text must be at least 10 characters for mem0")
+			return
+		}
+		userID := req.UserID
+		if userID == "" {
+			userID = "default"
+		}
+		s.ingestMem0(w, r.Context(), req.Text, userID)
+
+	default:
+		WriteError(w, http.StatusBadRequest, "invalid_target", "Target must be 'lightrag' or 'mem0'")
+	}
+}
+
+func (s *Server) ingestLightRAG(w http.ResponseWriter, ctx context.Context, text string, metadata map[string]string) {
+	// Add metadata headers
+	var sb strings.Builder
+	if st, ok := metadata["source_type"]; ok {
+		sb.WriteString("# Source-Type: " + st + "\n")
+	} else {
+		sb.WriteString("# Source-Type: agent-learning\n")
+	}
+	if domain, ok := metadata["domain"]; ok {
+		sb.WriteString("# Domain: " + domain + "\n")
+	}
+	sb.WriteString("# Ingested: " + time.Now().Format("2006-01-02") + "\n\n")
+	sb.WriteString(text)
+
+	body, _ := json.Marshal(map[string]string{
+		"text":        sb.String(),
+		"description": metadata["topic"],
+	})
+
+	lightragURL := config.Getenv("LIGHTRAG_URL", "http://lightrag.ns-agents.svc:9621")
+	lightragKey := config.Getenv("LIGHTRAG_API_KEY", "agents-lightrag-2026")
+
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	httpReq, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, lightragURL+"/documents/text", strings.NewReader(string(body)))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-API-Key", lightragKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		WriteError(w, http.StatusBadGateway, "lightrag_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
+func (s *Server) ingestMem0(w http.ResponseWriter, ctx context.Context, text string, userID string) {
+	body, _ := json.Marshal(map[string]any{
+		"messages": []map[string]string{
+			{"role": "user", "content": text},
+		},
+		"user_id": userID,
+	})
+
+	mem0URL := config.Getenv("MEM0_URL", "http://mem0.ns-agents.svc:8800")
+
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	httpReq, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, mem0URL+"/v1/memories/", strings.NewReader(string(body)))
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		WriteError(w, http.StatusBadGateway, "mem0_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
+// ─── Model Stats Endpoint ───────────────────────────────────────────────────
+
+// HandleModelStats returns per-model statistics from model_stats + model_rankings.
+func (s *Server) HandleModelStats(w http.ResponseWriter, r *http.Request) {
+	slog.Info("http request", "component", "http", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodGet {
+		WriteError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET allowed")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	rows, err := s.DB.Query(ctx, `
+		SELECT
+			r.model_id, r.display_name, r.provider, r.category_scores,
+			r.price_in_1m, r.price_out_1m, r.context_k,
+			COALESCE(s.total_requests, 0),
+			COALESCE(s.total_tokens_in, 0),
+			COALESCE(s.total_tokens_out, 0),
+			COALESCE(s.total_cost_usd, 0),
+			COALESCE(s.avg_duration_ms, 0),
+			COALESCE(s.error_count, 0),
+			COALESCE(s.success_rate, 0),
+			COALESCE(s.feedback_positive, 0),
+			COALESCE(s.feedback_negative, 0),
+			s.last_used_at
+		FROM model_rankings r
+		LEFT JOIN model_stats s ON r.model_id = s.model_id
+		ORDER BY COALESCE(s.total_cost_usd, 0) DESC
+	`)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var models []map[string]any
+	for rows.Next() {
+		var (
+			modelID, displayName, provider string
+			categoryScores                 json.RawMessage
+			priceIn, priceOut, totalCost   float64
+			contextK                       *int
+			totalReqs, avgDuration, errors int
+			tokensIn, tokensOut            int64
+			successRate                    float64
+			feedbackPos, feedbackNeg       int
+			lastUsed                       *time.Time
+		)
+		if err := rows.Scan(&modelID, &displayName, &provider, &categoryScores,
+			&priceIn, &priceOut, &contextK,
+			&totalReqs, &tokensIn, &tokensOut, &totalCost, &avgDuration, &errors,
+			&successRate, &feedbackPos, &feedbackNeg, &lastUsed); err != nil {
+			continue
+		}
+
+		feedbackScore := 0.0
+		if feedbackPos+feedbackNeg > 0 {
+			feedbackScore = float64(feedbackPos) / float64(feedbackPos+feedbackNeg) * 100
+		}
+
+		m := map[string]any{
+			"model_id":        modelID,
+			"display_name":    displayName,
+			"provider":        provider,
+			"category_scores": json.RawMessage(categoryScores),
+			"price_in_1m":     priceIn,
+			"price_out_1m":    priceOut,
+			"context_k":       contextK,
+			"total_requests":  totalReqs,
+			"total_tokens_in": tokensIn,
+			"total_tokens_out": tokensOut,
+			"total_cost_usd":  totalCost,
+			"avg_duration_ms": avgDuration,
+			"error_count":     errors,
+			"success_rate":    successRate,
+			"feedback_score":  feedbackScore,
+			"last_used_at":    lastUsed,
+		}
+		models = append(models, m)
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"models": models,
+		"count":  len(models),
+	})
+}

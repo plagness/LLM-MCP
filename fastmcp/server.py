@@ -108,6 +108,53 @@ async def llm_benchmarks() -> str:
     return await _get("/benchmarks")
 
 
+# === Balance ===
+
+@mcp.tool()
+async def llm_balance() -> str:
+    """Баланс OpenRouter и сводка расходов (день/неделя/месяц)."""
+    return await _get("/costs/balance")
+
+
+# === Model Stats ===
+
+@mcp.tool()
+async def llm_model_stats() -> str:
+    """Статистика по моделям: запросы, токены, расходы, feedback."""
+    return await _get("/models/stats")
+
+
+# === Feedback ===
+
+@mcp.tool()
+async def llm_feedback(model: str, rating: str, comment: str = "") -> str:
+    """Оценить качество ответа LLM. rating: good или bad."""
+    return await _post("/feedback", {"model": model, "rating": rating, "comment": comment})
+
+
+# === Knowledge ===
+
+@mcp.tool()
+async def llm_learn(text: str, topic: str, domain: str = "General") -> str:
+    """Записать знания в LightRAG. Для технических решений, архитектурных выводов.
+    Текст минимум 100 символов — будет обработан LLM для извлечения entities."""
+    return await _post("/knowledge/ingest", {
+        "text": text,
+        "target": "lightrag",
+        "metadata": {"source_type": "agent-learning", "topic": topic, "domain": domain},
+    })
+
+
+@mcp.tool()
+async def llm_remember(text: str, user_id: str = "default") -> str:
+    """Запомнить факт или предпочтение в mem0. Для настроек, привычек, контекста."""
+    return await _post("/knowledge/ingest", {
+        "text": text,
+        "target": "mem0",
+        "user_id": user_id,
+    })
+
+
 log.info("LLM FastMCP server ready")
 
 if __name__ == "__main__":

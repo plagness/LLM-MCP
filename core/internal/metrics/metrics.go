@@ -68,4 +68,41 @@ var (
 		},
 		[]string{"model", "device"},
 	)
+
+	// ChatRequests counts chat completion proxy requests.
+	ChatRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmcore_chat_requests_total",
+			Help: "Total chat completion proxy requests",
+		},
+		[]string{"model", "provider", "status"},
+	)
+
+	// ChatDuration tracks chat completion latency.
+	ChatDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "llmcore_chat_duration_seconds",
+			Help:    "Chat completion latency in seconds",
+			Buckets: []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120},
+		},
+		[]string{"model", "provider"},
+	)
+
+	// ChatTokens tracks tokens consumed by chat completions.
+	ChatTokens = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmcore_chat_tokens_total",
+			Help: "Total tokens for chat completion requests",
+		},
+		[]string{"model", "provider", "direction"},
+	)
+
+	// ChatCost tracks estimated cost of chat completions in USD.
+	ChatCost = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmcore_chat_cost_usd_total",
+			Help: "Estimated cost of chat completions in USD",
+		},
+		[]string{"model", "provider"},
+	)
 )

@@ -1,5 +1,51 @@
 # Changelog
 
+## [2026.03.11] - 2026-03-11
+
+### Chat Completions Proxy (sync + streaming)
+- `POST /v1/chat/completions` — OpenAI-compatible chat completion proxy
+- Роутинг: model с `/` → OpenRouter cloud, без `/` → Ollama device
+- Streaming: SSE pass-through для cloud, Ollama NDJSON → OpenAI SSE конвертация
+- Inline cost recording в llm_costs (без job queue)
+- Prometheus метрики: `llmcore_chat_requests_total`, `llmcore_chat_duration_seconds`, `llmcore_chat_tokens_total`, `llmcore_chat_cost_usd_total`
+
+### LightRAG через llmcore
+- LightRAG LLM вызовы теперь проходят через llmcore proxy (ранее — прямой вызов OpenRouter)
+- Все entity extraction запросы отслеживаются в метриках и llm_costs
+- Rollback: изменить LLM_BINDING_HOST обратно на OpenRouter URL
+
+### Model Rankings & Statistics
+- Миграция `05_chat_rankings.sql`: таблицы `model_rankings`, `model_stats`
+- Seed 8 моделей с category scores (programming, search, analysis, creative, science, multilingual)
+- `GET /v1/models/stats` — статистика по моделям (запросы, токены, расходы, feedback, success rate)
+
+### Cost & Analytics
+- `GET /v1/costs/balance` — баланс OpenRouter + расходы за день/неделю/месяц + top модели
+
+### Feedback
+- `POST /v1/feedback` — оценка качества ответа LLM (good/bad)
+- Обновляет `model_stats.feedback_positive/negative`
+
+### Knowledge Ingestion
+- `POST /v1/knowledge/ingest` — запись знаний в LightRAG (target=lightrag) или mem0 (target=mem0)
+- LightRAG: добавляет метаданные-заголовки, минимум 100 символов
+- mem0: формат messages API, минимум 10 символов
+
+### MCP Tools (6 новых)
+- `llm_balance` — баланс и расходы
+- `llm_model_stats` — статистика моделей
+- `llm_feedback` — оценка качества
+- `llm_learn` — запись знаний в LightRAG
+- `llm_remember` — запись фактов в mem0
+
+### Grafana Dashboards
+- Mods дашборд: +12 панелей (Chat Completions & Cost Analytics секция)
+- Stat panels: Chat Requests, Errors, Tokens, Cost, Latency, Total Rate
+- Timeseries: Chat+Embed Rate, Latency percentiles, Token Throughput, Cost by Model
+- Piechart: Chat Requests by Model
+
+---
+
 ## [2026.02.12] - 2026-02-14
 
 ### Smart Routing

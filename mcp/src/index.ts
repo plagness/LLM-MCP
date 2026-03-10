@@ -193,6 +193,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Проксирование: баланс OpenRouter + расходы
+  if (req.url === "/costs/balance" && req.method === "GET") {
+    proxyToCore(`${coreHttp}/v1/costs/balance`, "GET", null, res);
+    return;
+  }
+
+  // Проксирование: статистика моделей
+  if (req.url === "/models/stats" && req.method === "GET") {
+    proxyToCore(`${coreHttp}/v1/models/stats`, "GET", null, res);
+    return;
+  }
+
+  // Проксирование: feedback
+  if (req.url === "/feedback" && req.method === "POST") {
+    const raw = await readBody(req);
+    proxyToCore(`${coreHttp}/v1/feedback`, "POST", raw, res);
+    return;
+  }
+
+  // Проксирование: knowledge ingestion
+  if (req.url === "/knowledge/ingest" && req.method === "POST") {
+    const raw = await readBody(req);
+    proxyToCore(`${coreHttp}/v1/knowledge/ingest`, "POST", raw, res);
+    return;
+  }
+
   sendJson(res, 404, { error: "not_found" });
 });
 

@@ -52,5 +52,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/debug/capacity", s.HandleDebugCapacity)
 	mux.HandleFunc("/v1/debug/test", s.HandleDebugTest)
 	mux.HandleFunc("/v1/embeddings", s.HandleEmbeddings)
+	mux.HandleFunc("/v1/chat/completions", s.HandleChatCompletions)
+	mux.HandleFunc("/v1/costs/balance", s.HandleCostsBalance)
+	mux.HandleFunc("/v1/feedback", s.HandleFeedback)
+	mux.HandleFunc("/v1/knowledge/ingest", s.HandleKnowledgeIngest)
+	mux.HandleFunc("/v1/models/stats", s.HandleModelStats)
 	mux.Handle("/metrics", promhttp.Handler())
 }

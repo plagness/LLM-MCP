@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -3115,7 +3116,14 @@ func (s *Server) selectModel(ctx context.Context, taskType, accuracy string, max
 			}
 		}
 
-		score := catScore*accWeight - costFactor*estCost
+		// Normalize price tier: price_in per 1M tokens, log scale
+		// This ensures cheap models are preferred for low accuracy regardless of prompt length
+		priceTier := 0.0
+		if priceIn > 0 {
+			priceTier = math.Log10(priceIn*1000+1) * 10 // e.g. 0.075→~1.9, 3.0→~35, 15.0→~42
+		}
+
+		score := catScore*accWeight - costFactor*priceTier
 
 		candidates = append(candidates, candidate{modelID: modelID, score: score})
 	}

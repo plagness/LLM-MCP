@@ -31,12 +31,25 @@
 - LightRAG: добавляет метаданные-заголовки, минимум 100 символов
 - mem0: формат messages API, минимум 10 символов
 
-### MCP Tools (6 новых)
+### Smart Model Selection
+- Автоматический выбор модели если `model` не указана
+- `task_type` (programming, search, analysis, creative, science) + `accuracy` (low/medium/high/critical)
+- Нормализованный ценовой скоринг: low → дешёвые модели, critical → лучшее качество
+- Headers: `X-Task-Type`, `X-Accuracy`, `X-Max-Cost`; Response: `X-Selected-Model`
+- `POST /v1/models/sync` — синхронизация каталога моделей из OpenRouter API
+- `llmcore_openrouter_balance_usd` gauge метрика
+
+### Per-Request Model Stats Tracking
+- Каждый chat completion инкрементирует `model_stats` (requests, tokens, cost, duration, errors)
+- Данные доступны через `GET /v1/models/stats`
+
+### MCP Tools (7 новых)
 - `llm_balance` — баланс и расходы
 - `llm_model_stats` — статистика моделей
 - `llm_feedback` — оценка качества
 - `llm_learn` — запись знаний в LightRAG
 - `llm_remember` — запись фактов в mem0
+- `llm_sync_models` — синхронизация каталога моделей
 
 ### Grafana Dashboards
 - Mods дашборд: +12 панелей (Chat Completions & Cost Analytics секция)

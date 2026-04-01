@@ -1,0 +1,13 @@
+category: ai
+type: opensource
+status: active
+title:
+  en: "LLM MCP"
+  ru: "LLM MCP"
+description:
+  en: "LLM routing core + workers"
+  ru: "Ядро маршрутизации LLM + воркеры"
+tags: [mcp, go, llm, routing]
+focus:
+  - backend
+  - ai
